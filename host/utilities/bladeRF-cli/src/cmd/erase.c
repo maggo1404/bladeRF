@@ -1,7 +1,7 @@
 /*
  * This file is part of the bladeRF project
  *
- * Copyright (C) 2013 Nuand LLC
+ * Copyright (C) 2013-2014 Nuand LLC
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -27,39 +27,36 @@ int cmd_erase(struct cli_state *state, int argc, char **argv)
 {
     int status;
     int addr, len;
-    int sector_offset, n_sectors;
+    int eb_offset, n_ebs;
     bool ok;
 
-    if (!cli_device_is_opened(state)) {
-        return CMD_RET_NODEV;
-    }
-
     if (argc != 3) {
-        return CMD_RET_NARGS;
+        return CLI_RET_NARGS;
     }
 
-    sector_offset = str2uint(argv[1], 0, INT_MAX, &ok);
+    eb_offset = str2uint(argv[1], 0, INT_MAX, &ok);
     if(!ok) {
-        cli_err(state, argv[0], "Invalid value for \"sector_offset\" (%s)", argv[1]);
-        return CMD_RET_INVPARAM;
+        cli_err(state, argv[0],
+                "Invalid value for \"eb_offset\" (%s)\n", argv[1]);
+        return CLI_RET_INVPARAM;
     }
 
-    n_sectors = str2uint(argv[2], 0, INT_MAX, &ok);
+    n_ebs = str2uint(argv[2], 0, INT_MAX, &ok);
     if(!ok) {
-        cli_err(state, argv[0], "Invalid value for \"n_sectors\" (%s)", argv[2]);
-        return CMD_RET_INVPARAM;
+        cli_err(state, argv[0], "Invalid value for \"n_ebs\" (%s)\n", argv[2]);
+        return CLI_RET_INVPARAM;
     }
 
-    addr = sector_offset * BLADERF_FLASH_SECTOR_SIZE;
-    len  = n_sectors * BLADERF_FLASH_SECTOR_SIZE;
+    addr = eb_offset * BLADERF_FLASH_EB_SIZE;
+    len  = n_ebs * BLADERF_FLASH_EB_SIZE;
 
     status = bladerf_erase_flash(state->dev, addr, len);
 
     if (status >= 0) {
-        printf("Erased %d bytes at 0x%02x\n", status, addr);
-        return CMD_RET_OK;
+        printf("\n  Erased %d bytes at 0x%02x\n\n", status, addr);
+        return CLI_RET_OK;
     } else {
         state->last_lib_error = status;
-        return CMD_RET_LIBBLADERF;
+        return CLI_RET_LIBBLADERF;
     }
 }

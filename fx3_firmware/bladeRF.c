@@ -32,7 +32,7 @@
 #include "cyu3gpio.h"
 #include "pib_regs.h"
 
-#include "firmware.h"
+#include "flash.h"
 #include "spi_flash_lib.h"
 #include "rf.h"
 #include "fpga.h"
@@ -52,6 +52,9 @@ uint8_t glPageBuffer[FLASH_PAGE_SIZE] __attribute__ ((aligned (32)));
 CyBool_t glCalCacheValid = CyFalse;
 uint8_t glCal[CAL_BUFFER_SIZE] __attribute__ ((aligned (32)));
 
+CyBool_t glDeviceReady   = CyFalse;         /* Used to denote that the device
+                                             * can't be accessed until the FPGA
+                                             * autoload is finished */
 CyBool_t glAutoLoadValid = CyFalse;
 uint8_t glAutoLoad[CAL_BUFFER_SIZE] __attribute__ ((aligned (32)));
 
@@ -235,16 +238,28 @@ CyBool_t GetStatus(uint16_t endpoint) {
     return isHandled;
 }
 
-void ClearDMAChannel(uint8_t ep, CyU3PDmaChannel * handle, uint32_t count, CyBool_t stall_only) {
-    CyU3PDmaChannelReset (handle);
-    CyU3PUsbFlushEp(ep);
-    CyU3PUsbResetEp(ep);
-    CyU3PDmaChannelSetXfer (handle, count);
-    CyU3PUsbStall (ep, CyFalse, CyTrue);
+CyU3PReturnStatus_t ClearDMAChannel(uint8_t ep,
+                                    CyU3PDmaChannel * handle,
+                                    uint32_t count)
+{
+    CyU3PReturnStatus_t status;
 
-    if(!stall_only) {
-        CyU3PUsbAckSetup ();
+    status = CyU3PDmaChannelReset(handle);
+    if (status != CY_U3P_SUCCESS) {
+        return status;
     }
+
+    status = CyU3PUsbFlushEp(ep);
+    if (status != CY_U3P_SUCCESS) {
+        return status;
+    }
+
+    status = CyU3PUsbResetEp(ep);
+    if (status != CY_U3P_SUCCESS) {
+        return status;
+    }
+
+    return CyU3PDmaChannelSetXfer (handle, count);
 }
 
 CyBool_t ClearHaltCondition(uint16_t endpoint) {
@@ -330,8 +345,14 @@ CyBool_t NuandHandleVendorRequest(
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
     int retStatus;
     uint16_t readC;
-
+    CyBool_t txen, rxen;
+    txen = rxen = CyFalse ;
     isHandled = CyTrue;
+
+    /* Device is not ready to handle requests */
+    if (!glDeviceReady && bRequest != BLADE_USB_CMD_QUERY_DEVICE_READY) {
+        return -1;
+    }
 
     switch (bRequest)
     {
@@ -342,42 +363,54 @@ CyBool_t NuandHandleVendorRequest(
     break;
 
     case BLADE_USB_CMD_RF_RX:
-        CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
-        CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
-
         apiRetStatus = CY_U3P_SUCCESS;
         use_feature = wValue;
 
+        CyU3PGpioGetValue(GPIO_TX_EN, &txen) ;
+        CyU3PGpioGetValue(GPIO_RX_EN, &rxen) ;
+        if (txen == CyFalse && rxen == CyFalse) {
+            CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue) ;
+            CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
+        }
+
+        CyU3PGpioSetValue(GPIO_RX_EN, use_feature ? CyTrue : CyFalse);
+
         if (!use_feature) {
-            apiRetStatus = CyU3PUsbResetEp(BLADE_RF_SAMPLE_EP_CONSUMER);
+            const uint8_t ep = BLADE_RF_SAMPLE_EP_CONSUMER;
+            apiRetStatus = NuandRFLink.reset_endpoint(ep);
             if(apiRetStatus != CY_U3P_SUCCESS) {
                 CyU3PDebugPrint (4,
-                        "Failed reset USB, error code = %d\n",
-                        apiRetStatus);
+                                 "Failed reset ep %u, error code = %d\n",
+                                 ep, apiRetStatus);
             }
         }
 
-        apiRetStatus = CyU3PGpioSetValue(GPIO_RX_EN, use_feature ? CyTrue : CyFalse);
         CyU3PUsbSendRetCode(apiRetStatus);
     break;
 
     case BLADE_USB_CMD_RF_TX:
-        CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
-        CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
-
         apiRetStatus = CY_U3P_SUCCESS;
         use_feature = wValue;
 
+        CyU3PGpioGetValue(GPIO_TX_EN, &txen) ;
+        CyU3PGpioGetValue(GPIO_RX_EN, &rxen) ;
+        if (txen == CyFalse && rxen == CyFalse) {
+            CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue) ;
+            CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
+        }
+
+        CyU3PGpioSetValue(GPIO_TX_EN, use_feature ? CyTrue : CyFalse);
+
         if (!use_feature) {
-            apiRetStatus = CyU3PUsbResetEp(BLADE_RF_SAMPLE_EP_PRODUCER);
+            const uint8_t ep = BLADE_RF_SAMPLE_EP_PRODUCER;
+            apiRetStatus = NuandRFLink.reset_endpoint(ep);
             if(apiRetStatus != CY_U3P_SUCCESS) {
                 CyU3PDebugPrint (4,
-                        "Failed reset USB, error code = %d\n",
-                        apiRetStatus);
+                                 "Failed reset ep %u, error code = %d\n",
+                                 ep, apiRetStatus);
             }
         }
 
-        apiRetStatus = CyU3PGpioSetValue(GPIO_TX_EN, use_feature ? CyTrue : CyFalse);
         CyU3PUsbSendRetCode(apiRetStatus);
     break;
 
@@ -395,6 +428,23 @@ CyBool_t NuandHandleVendorRequest(
         }
 
         CyU3PUsbSendRetCode(ret);
+    break;
+
+    case BLADE_USB_CMD_QUERY_DEVICE_READY:
+        ret = glDeviceReady ? 1 : 0;
+        CyU3PUsbSendRetCode(ret);
+    break;
+
+    case BLADE_USB_CMD_SET_LOOPBACK:
+        NuandRFLinkLoopBack(wValue);
+        CyU3PUsbSendRetCode(wValue);
+    break;
+
+    case BLADE_USB_CMD_GET_LOOPBACK:
+    {
+        int isLoopbackEnabled = NuandRFLinkGetLoopBack();
+        CyU3PUsbSendRetCode(isLoopbackEnabled);
+    }
     break;
 
     case BLADE_USB_CMD_READ_PAGE_BUFFER:
@@ -522,7 +572,7 @@ CyBool_t NuandHandleVendorRequest(
 
     case BLADE_USB_CMD_JUMP_TO_BOOTLOADER:
         StopApplication();
-        NuandFirmwareStart();
+        NuandFlashInit();
 
         // Erase the first sector so we can write the bootloader
         // header
@@ -674,7 +724,7 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
             switch(glUsbAltInterface) {
                 case USB_IF_CONFIG: NuandFpgaConfig.stop() ; break ;
                 case USB_IF_RF_LINK: NuandRFLink.stop(); break ;
-                case USB_IF_SPI_FLASH: NuandFirmwareStop(); break ;
+                case USB_IF_SPI_FLASH: NuandFlashDeinit(); break ;
                 default: break ;
             }
 
@@ -684,7 +734,7 @@ void CyFxbladeRFApplnUSBEventCB (CyU3PUsbEventType_t evtype, uint16_t evdata)
             } else if (alt_interface == USB_IF_RF_LINK) {
                 NuandRFLink.start();
             } else if (alt_interface == USB_IF_SPI_FLASH) {
-                NuandFirmwareStart();
+                NuandFlashInit();
             }
             glUsbAltInterface = alt_interface;
         break;
@@ -732,7 +782,7 @@ static void extractSerialAndCal(void)
     char serial_buf[32];
     int i;
 
-    NuandFirmwareStart();
+    NuandFlashInit();
 
     status = NuandReadOtp(0, 0x100, otp_buf);
 
@@ -753,25 +803,12 @@ static void extractSerialAndCal(void)
         glAutoLoadValid = CyTrue;
     }
 
-    NuandFirmwareStop();
+    NuandFlashDeinit();
 }
 
 void bladeRFInit(void)
 {
-    CyU3PPibClock_t pibClock;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
-
-    /* Initialize the p-port block. */
-    pibClock.clkDiv = 4;
-    pibClock.clkSrc = CY_U3P_SYS_CLK;
-    pibClock.isHalfDiv = CyFalse;
-    /* Enable DLL for async GPIF */
-    pibClock.isDllEnable = CyFalse;
-    apiRetStatus = CyU3PPibInit(CyTrue, &pibClock);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        CyU3PDebugPrint (4, "P-port Initialization failed, Error Code = %d\n",apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
-    }
 
     /* Start the USB functionality. */
     apiRetStatus = CyU3PUsbStart();
@@ -902,28 +939,33 @@ void bladeRFInit(void)
 /* Entry function for the bladeRFAppThread. */
 void bladeRFAppThread_Entry( uint32_t input)
 {
-    uint8_t state;
-    int cnt;
     CyFxGpioInit();
 
     populateVersionString();
     extractSerialAndCal();
 
     bladeRFInit();
+    /* XXX Why do we need an 800ms delay here? It appears required for the FPGA
+     * load...
+     *
+     * Is there an I/O or state variable that we could instead poll?
+     */
+    CyU3PThreadSleep(800);
 
-    FpgaBeginProgram();
-    for (cnt = 0;;cnt++) {
-        CyU3PThreadSleep (100);
-        if (cnt == 8 && glAutoLoadValid) {
-            char fpga_len[11];
-            if (!NuandExtractField((void*)glAutoLoad, 0x100, "LEN", (char *)&fpga_len, 10)) {
-                fpga_len[10] = 0;
-                NuandLoadFromFlash(atoi(fpga_len));
-            }
-
+    if (glAutoLoadValid) {
+        char fpga_len[11] = {0};
+        if (!NuandExtractField((void*)glAutoLoad, 0x100, "LEN", (char *)&fpga_len, 10)) {
+            fpga_len[10] = 0;
+            FpgaBeginProgram();
+            NuandLoadFromFlash(atoi(fpga_len));
         }
+    }
 
-        CyU3PGpifGetSMState(&state);
+    glDeviceReady = CyTrue;
+
+    while ( 1 ) {
+        /* Additional application-specific code can go here */
+        CyU3PThreadSleep(1000);
     }
 }
 
@@ -961,7 +1003,6 @@ void CyFxApplicationDefine(void)
  */
 int main(void)
 {
-    CyU3PIoMatrixConfig_t io_cfg;
     CyU3PReturnStatus_t status = CY_U3P_SUCCESS;
 
     /* Initialize the device */
@@ -977,24 +1018,6 @@ int main(void)
     }
 
     NuandFpgaConfigSwInit();
-
-    io_cfg.useUart   = CyTrue;
-    io_cfg.useI2C    = CyFalse;
-    io_cfg.useI2S    = CyFalse;
-    io_cfg.useSpi    = CyFalse;
-    io_cfg.isDQ32Bit = CyTrue;
-    io_cfg.lppMode   = CY_U3P_IO_MATRIX_LPP_DEFAULT;
-
-    /* No GPIOs are enabled. */
-    io_cfg.gpioSimpleEn[0]  = 0;
-    io_cfg.gpioSimpleEn[1]  = 0;
-    io_cfg.gpioComplexEn[0] = 0;
-    io_cfg.gpioComplexEn[1] = 0;
-    status = CyU3PDeviceConfigureIOMatrix (&io_cfg);
-    if (status != CY_U3P_SUCCESS)
-    {
-        goto handle_fatal_error;
-    }
 
     /* This is a non returnable call for initializing the RTOS kernel */
     CyU3PKernelEntry();

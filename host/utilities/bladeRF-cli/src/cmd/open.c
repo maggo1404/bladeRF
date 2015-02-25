@@ -1,7 +1,7 @@
 /*
  * This file is part of the bladeRF project
  *
- * Copyright (C) 2013 Nuand LLC
+ * Copyright (C) 2013-2014 Nuand LLC
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -34,12 +34,7 @@ int cmd_open(struct cli_state *state, int argc, char **argv)
     size_t dev_ident_len;
     int i;
     int status;
-	int ret;
-
-    /* Disallow opening of a diffrent device if the current one is doing work */
-    if (cli_device_in_use(state)) {
-        return CMD_RET_BUSY;
-    }
+    int ret;
 
     if (state->dev) {
         bladerf_close(state->dev);
@@ -58,7 +53,7 @@ int cmd_open(struct cli_state *state, int argc, char **argv)
 
         dev_ident = calloc(dev_ident_len, 1);
         if (!dev_ident) {
-            return CMD_RET_MEM;
+            return CLI_RET_MEM;
         }
 
         for (i = 1; i < argc; i++) {
@@ -69,15 +64,16 @@ int cmd_open(struct cli_state *state, int argc, char **argv)
             }
         }
 
-        printf("Using device string: %s\n", dev_ident);
+        printf("\n  Using device string: %s\n", dev_ident);
     }
 
     status = bladerf_open(&state->dev, dev_ident);
     if (status) {
         state->last_lib_error = status;
-        ret = CMD_RET_LIBBLADERF;
+        ret = CLI_RET_LIBBLADERF;
     } else {
         ret = 0;
+        putchar('\n');
     }
 
     free(dev_ident);

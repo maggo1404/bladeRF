@@ -36,6 +36,29 @@ set_global_assignment -name RESERVE_FLASH_NCE_AFTER_CONFIGURATION "USE AS REGULA
 set_global_assignment -name RESERVE_OTHER_AP_PINS_AFTER_CONFIGURATION "USE AS REGULAR IO"
 set_global_assignment -name CYCLONEII_RESERVE_NCEO_AFTER_CONFIGURATION "USE AS REGULAR IO"
 set_global_assignment -name RESERVE_DCLK_AFTER_CONFIGURATION "USE AS REGULAR IO"
+set_global_assignment -name OUTPUT_IO_TIMING_NEAR_END_VMEAS "HALF VCCIO" -rise
+set_global_assignment -name OUTPUT_IO_TIMING_NEAR_END_VMEAS "HALF VCCIO" -fall
+set_global_assignment -name OUTPUT_IO_TIMING_FAR_END_VMEAS "HALF SIGNAL SWING" -rise
+set_global_assignment -name OUTPUT_IO_TIMING_FAR_END_VMEAS "HALF SIGNAL SWING" -fall
+set_global_assignment -name CYCLONEII_OPTIMIZATION_TECHNIQUE SPEED
+set_global_assignment -name PHYSICAL_SYNTHESIS_COMBO_LOGIC ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_DUPLICATION ON
+set_global_assignment -name PHYSICAL_SYNTHESIS_REGISTER_RETIMING ON
+set_global_assignment -name ROUTER_LCELL_INSERTION_AND_LOGIC_DUPLICATION ON
+set_global_assignment -name ROUTER_TIMING_OPTIMIZATION_LEVEL MAXIMUM
+set_global_assignment -name AUTO_PACKED_REGISTERS_STRATIXII NORMAL
+set_global_assignment -name FITTER_EFFORT "STANDARD FIT"
+set_global_assignment -name ADV_NETLIST_OPT_SYNTH_WYSIWYG_REMAP ON
+set_global_assignment -name ROUTER_CLOCKING_TOPOLOGY_ANALYSIS ON
+set_global_assignment -name ENABLE_DRC_SETTINGS ON
+set_instance_assignment -name FAST_INPUT_REGISTER ON -to lms_rx_data[*]
+set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to fx3_gpif[*]
+set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to lms_tx_data[*]
+set_instance_assignment -name FAST_OUTPUT_REGISTER ON -to fx3_ctl[*]
+set_instance_assignment -name FAST_OUTPUT_ENABLE_REGISTER ON -to fx3_gpif[*]
+set_global_assignment -name OPTIMIZE_POWER_DURING_FITTING "EXTRA EFFORT"
+set_global_assignment -name FITTER_AUTO_EFFORT_DESIRED_SLACK_MARGIN "1 ns"
+#set_global_assignment -name RESERVE_ALL_UNUSED_PINS_WEAK_PULLUP "AS OUTPUT DRIVING GROUND"
 
 # Create an base revision
 set_global_assignment -name QIP_FILE [file normalize ../../fpga/platforms/bladerf/bladerf.qip]
@@ -54,6 +77,9 @@ make_revision fsk_bridge
 
 # Create QPSK transmitter
 make_revision qpsk_tx
+
+# Create ATSC transmitter
+make_revision atsc_tx
 
 # Projects created!
 puts "bladeRF projects created.  Please use the build.tcl script to build images.\n"

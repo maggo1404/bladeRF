@@ -7,8 +7,6 @@ set_instance_assignment -name IO_STANDARD "1.8 V" -to dac_csx
 set_instance_assignment -name IO_STANDARD "1.8 V" -to dac_sclk
 set_instance_assignment -name IO_STANDARD "1.8 V" -to dac_sdi
 set_instance_assignment -name IO_STANDARD "1.8 V" -to dac_sdo
-set_instance_assignment -name IO_STANDARD "1.8 V" -to refexp_1pps
-set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_clock
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[16]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[15]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[14]
@@ -24,7 +22,6 @@ set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[5]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[4]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[3]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[2]
-set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_gpio[1]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_present
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_spi_clock
 set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_spi_miso
@@ -32,6 +29,7 @@ set_instance_assignment -name IO_STANDARD "1.8 V" -to exp_spi_mosi
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[12]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[11]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[10]
+set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[9]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[8]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[7]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[6]
@@ -73,12 +71,11 @@ set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_gpif[3]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_gpif[2]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_gpif[1]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_gpif[0]
-set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_uart_csx
+set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_uart_cts
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_uart_rxd
 set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_uart_txd
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_pll_out
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_reset
-set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_rx_clock
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_rx_clock_out
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_rx_data[11]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_rx_data[10]
@@ -98,7 +95,6 @@ set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_sclk
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_sdio
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_sdo
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_sen
-set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_clock
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_data[11]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_data[10]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_data[9]
@@ -113,7 +109,6 @@ set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_data[1]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_data[0]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_enable
 set_instance_assignment -name IO_STANDARD "1.8 V" -to lms_tx_iq_select
-set_instance_assignment -name IO_STANDARD "1.8 V" -to fx3_ctl[9]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to led[3]
 set_instance_assignment -name IO_STANDARD "1.8 V" -to altera_reserved_tdi
 set_instance_assignment -name IO_STANDARD "1.8 V" -to altera_reserved_tck
@@ -201,11 +196,10 @@ set_location_assignment PIN_A5 -to fx3_gpif[3]
 set_location_assignment PIN_B8 -to fx3_gpif[2]
 set_location_assignment PIN_B7 -to fx3_gpif[1]
 set_location_assignment PIN_B6 -to fx3_gpif[0]
-set_location_assignment PIN_AA4 -to fx3_uart_csx
+set_location_assignment PIN_AA4 -to fx3_uart_cts
 set_location_assignment PIN_AA5 -to fx3_uart_rxd
 set_location_assignment PIN_AA3 -to fx3_uart_txd
 set_location_assignment PIN_T21 -to lms_pll_out
-set_location_assignment PIN_K21 -to lms_rx_clock
 set_location_assignment PIN_T22 -to lms_rx_clock_out
 set_location_assignment PIN_B22 -to lms_rx_data[11]
 set_location_assignment PIN_B21 -to lms_rx_data[10]
@@ -220,7 +214,6 @@ set_location_assignment PIN_H21 -to lms_rx_data[2]
 set_location_assignment PIN_F22 -to lms_rx_data[1]
 set_location_assignment PIN_J21 -to lms_rx_data[0]
 set_location_assignment PIN_H22 -to lms_rx_iq_select
-set_location_assignment PIN_L21 -to lms_tx_clock
 set_location_assignment PIN_U21 -to lms_tx_data[11]
 set_location_assignment PIN_P22 -to lms_tx_data[10]
 set_location_assignment PIN_U22 -to lms_tx_data[9]
@@ -243,8 +236,7 @@ set_location_assignment PIN_AB16 -to lms_sen
 set_location_assignment PIN_AB19 -to lms_rx_v[2]
 set_location_assignment PIN_AB20 -to lms_rx_v[1]
 set_location_assignment PIN_J22 -to lms_tx_iq_select
-set_location_assignment PIN_B13 -to exp_spi_mosi
-set_location_assignment PIN_A14 -to exp_gpio[1]
+set_location_assignment PIN_F11 -to exp_spi_mosi
 set_location_assignment PIN_D13 -to exp_gpio[2]
 set_location_assignment PIN_E13 -to exp_gpio[3]
 set_location_assignment PIN_E14 -to exp_gpio[4]
@@ -263,12 +255,12 @@ set_location_assignment PIN_A13 -to exp_gpio[16]
 set_location_assignment PIN_C13 -to exp_present
 set_location_assignment PIN_G1 -to fx3_pclk
 set_location_assignment PIN_AA15 -to lms_sclk
-set_location_assignment PIN_F11 -to exp_spi_miso
-set_location_assignment PIN_E12 -to exp_spi_clock
+set_location_assignment PIN_B13 -to exp_spi_miso
+set_location_assignment PIN_E11 -to exp_spi_clock
 set_location_assignment PIN_AA7 -to led[1]
 set_location_assignment PIN_AB7 -to led[2]
 set_location_assignment PIN_AA21 -to lms_tx_v[1]
-set_location_assignment PIN_K2 -to fx3_ctl[9] -disable
+set_location_assignment PIN_J3 -to fx3_ctl[9]
 set_location_assignment PIN_G22 -to c4_tx_clock
 set_location_assignment PIN_A12 -to exp_clock_in
 set_location_assignment PIN_A14 -to exp_gpio[25]
@@ -313,4 +305,9 @@ set_global_assignment -name RESERVE_FLASH_NCE_AFTER_CONFIGURATION "USE AS REGULA
 set_global_assignment -name RESERVE_OTHER_AP_PINS_AFTER_CONFIGURATION "USE AS REGULAR IO"
 set_global_assignment -name CYCLONEII_RESERVE_NCEO_AFTER_CONFIGURATION "USE AS REGULAR IO"
 set_global_assignment -name RESERVE_DCLK_AFTER_CONFIGURATION "USE AS REGULAR IO"
+
+# Drive Strength and Slew Rate
+set_instance_assignment -name SLEW_RATE 0 -to fx3_gpif[*]
+#set_instance_assignment -name CURRENT_STRENGTH_NEW 16MA -to fx3_gpif[*]
+set_instance_assignment -name CURRENT_STRENGTH_NEW 4MA -to fx3_uart_rxd
 

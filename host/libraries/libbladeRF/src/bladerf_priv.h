@@ -31,123 +31,38 @@
 
 #include <limits.h>
 #include <libbladeRF.h>
+#include "bladeRF.h"
+#include <pthread.h>
 #include "host_config.h"
+
+#if BLADERF_OS_WINDOWS || BLADERF_OS_OSX
+#include "clock_gettime.h"
+#else
+#include <time.h>
+#endif
+
+#include "thread.h"
 #include "minmax.h"
 #include "conversions.h"
 #include "devinfo.h"
-
 #include "flash.h"
+#include "backend/backend.h"
+#include "rel_assert.h"
 
-typedef enum {
-    ETYPE_ERRNO,
-    ETYPE_LIBBLADERF,
-    ETYPE_BACKEND,
-    ETYPE_OTHER = INT_MAX - 1
-} bladerf_error_type;
+/* 1 TX, 1 RX */
+#define NUM_MODULES 2
 
-struct bladerf_error {
-    bladerf_error_type type;
-    int value;
-};
+/* For >= 1.5 GHz uses the high band should be used. Otherwise, the low
+ * band should be selected */
+#define BLADERF_BAND_HIGH (1500000000)
 
-typedef enum {
-    STREAM_IDLE,            /* Idle and initialized */
-    STREAM_RUNNING,         /* Currently running */
-    STREAM_SHUTTING_DOWN,   /* Currently tearing down.
-                             * See bladerf_stream->error_code to determine
-                             * whether or not the shutdown was a clean exit
-                             * or due to an error. */
-    STREAM_DONE             /* Done and deallocated */
-} bladerf_stream_state;
+#define CONFIG_GPIO_WRITE(dev, val) config_gpio_write(dev, val)
+#define CONFIG_GPIO_READ(dev, val)  dev->fn->config_gpio_read(dev, val)
 
-struct bladerf_stream {
-    struct bladerf *dev;
-    bladerf_module module;
-    int error_code;
-    bladerf_stream_state state;
-
-    size_t samples_per_buffer;
-    size_t num_buffers;
-    size_t num_transfers;
-    bladerf_format format;
-
-    void **buffers;
-    void *backend_data;
-
-    bladerf_stream_cb cb;
-    void *user_data;
-};
+#define DAC_WRITE(dev, val) dev->fn->dac_write(dev, val)
 
 /* Forward declaration for the function table */
 struct bladerf;
-
-/* Driver specific function table.  These functions are required for each
-   unique platform to operate the device. */
-struct bladerf_fn {
-
-    /* Backends probe for devices and append entries to this list using
-     * bladerf_devinfo_list_append() */
-    int (*probe)(struct bladerf_devinfo_list *info_list);
-
-    /* Opening device based upon specified device info
-     * devinfo structure. The implementation of this function is responsible
-     * for ensuring (*device)->ident is populated */
-    int (*open)(struct bladerf **device,  struct bladerf_devinfo *info);
-
-    /* Closing of the device and freeing of the data */
-    int (*close)(struct bladerf *dev);
-
-    /* FPGA Loading and checking */
-    int (*load_fpga)(struct bladerf *dev, uint8_t *image, size_t image_size);
-    int (*is_fpga_configured)(struct bladerf *dev);
-
-    /* Flash FX3 firmware */
-    int (*flash_firmware)(struct bladerf *dev, uint8_t *image, size_t image_size);
-
-    /* Flash operations */
-    int (*erase_flash)(struct bladerf *dev, uint32_t addr, uint32_t len);
-    int (*read_flash) (struct bladerf *dev, uint32_t addr, uint8_t *buf,
-                       uint32_t len);
-    int (*write_flash)(struct bladerf *dev, uint32_t addr, uint8_t *buf,
-                       uint32_t len);
-    int (*device_reset)(struct bladerf *dev);
-
-    int (*jump_to_bootloader)(struct bladerf *dev);
-
-    /* Platform information */
-    int (*get_cal)(struct bladerf *dev, char *cal);
-    int (*get_otp)(struct bladerf *dev, char *otp);
-    int (*get_device_speed)(struct bladerf *dev, bladerf_dev_speed *speed);
-
-    /* Configuration GPIO accessors */
-    int (*config_gpio_write)(struct bladerf *dev, uint32_t val);
-    int (*config_gpio_read)(struct bladerf *dev, uint32_t *val);
-
-    /* Si5338 accessors */
-    int (*si5338_write)(struct bladerf *dev, uint8_t addr, uint8_t data);
-    int (*si5338_read)(struct bladerf *dev, uint8_t addr, uint8_t *data);
-
-    /* LMS6002D accessors */
-    int (*lms_write)(struct bladerf *dev, uint8_t addr, uint8_t data);
-    int (*lms_read)(struct bladerf *dev, uint8_t addr, uint8_t *data);
-
-    /* VCTCXO accessor */
-    int (*dac_write)(struct bladerf *dev, uint16_t value);
-
-    /* Sample stream */
-    int (*rx)(struct bladerf *dev, bladerf_format format, void *samples, int n, struct bladerf_metadata *metadata);
-    int (*tx)(struct bladerf *dev, bladerf_format format, void *samples, int n, struct bladerf_metadata *metadata);
-
-    int (*init_stream)(struct bladerf_stream *stream);
-    int (*stream)(struct bladerf_stream *stream, bladerf_module module);
-    void (*deinit_stream)(struct bladerf_stream *stream);
-
-    void (*set_transfer_timeout)(struct bladerf *dev, bladerf_module module, int timeout);
-    int (*get_transfer_timeout)(struct bladerf *dev, bladerf_module module);
-
-    /* Gather statistics */
-    int (*stats)(struct bladerf *dev, struct bladerf_stats *stats);
-};
 
 #define FW_LEGACY_ALT_SETTING_MAJOR 1
 #define FW_LEGACY_ALT_SETTING_MINOR 1
@@ -159,7 +74,25 @@ struct bladerf_fn {
 
 #define BLADERF_VERSION_STR_MAX 32
 
+#define BLADERF_HAS_CAL_(dev, name)  (dev->cal.name != NULL)
+#define BLADERF_HAS_RX_DC_CAL(dev)   (BLADERF_HAS_CAL_(dev, dc_rx))
+#define BLADERF_HAS_TX_DC_CAL(dev)   (BLADERF_HAS_CAL_(dev, dc_tx))
+
+struct calibrations {
+    struct dc_cal_tbl *dc_rx;
+    struct dc_cal_tbl *dc_tx;
+};
+
 struct bladerf {
+
+    /* Control lock - use this to ensure atomic access to control and
+     * configuration operations */
+    MUTEX ctrl_lock;
+
+    /* Ensure sync transfers occur atomically. If this is to be held in
+     * conjunction with ctrl_lock, ctrl_lock should be acquired BEFORE
+     * the relevant sync_lock[] */
+    MUTEX sync_lock[NUM_MODULES];
 
     struct bladerf_devinfo ident;  /* Identifying information */
 
@@ -171,115 +104,141 @@ struct bladerf {
     int legacy;
 
     bladerf_dev_speed usb_speed;
-
-    struct bladerf_stats stats;
-
-    /* Last error encountered */
-    struct bladerf_error error;
+    size_t msg_size; /* Fundamental "chunk" size of the data the FPGA sends to
+                      * the host, in BYTES */
 
     /* Backend's private data  */
     void *backend;
 
     /* Driver-sppecific implementations */
-    const struct bladerf_fn *fn;
+    const struct backend_fns *fn;
 
-    int transfer_timeout[2];
+    /* Stream transfer timeouts for RX and TX */
+    int transfer_timeout[NUM_MODULES];
+
+    /* Synchronous interface handles */
+    struct bladerf_sync *sync[NUM_MODULES];
+
+    /* Calibration data */
+    struct calibrations cal;
+
+    /* Track filterbank selection for RX autoselection */
+    bladerf_xb200_filter rx_filter;
+
+    /* Track filterbank selection for TX autoselection */
+    bladerf_xb200_filter tx_filter;
+
+    /* Format currently being used with a module, or -1 if module is not used */
+    bladerf_format module_format[NUM_MODULES];
 };
+
+/*
+ * Convert bytes to SC16Q11 samples
+ */
+static inline size_t bytes_to_sc16q11(size_t n_bytes)
+{
+    const size_t sample_size = 2 * sizeof(int16_t);
+    assert((n_bytes % sample_size) == 0);
+    return n_bytes / sample_size;
+}
+
+/*
+ * Convert SC16Q11 samples to bytes
+ */
+static inline size_t sc16q11_to_bytes(size_t n_samples)
+{
+    const size_t sample_size = 2 * sizeof(int16_t);
+    assert(n_samples <= (SIZE_MAX / sample_size));
+    return n_samples * sample_size;
+}
+
+/* Covert samples to bytes based upon the provided format */
+static inline size_t samples_to_bytes(bladerf_format format, size_t n)
+{
+    switch (format) {
+        case BLADERF_FORMAT_SC16_Q11:
+        case BLADERF_FORMAT_SC16_Q11_META:
+            return sc16q11_to_bytes(n);
+
+        default:
+            assert(!"Invalid format");
+            return 0;
+    }
+}
+
+/* Convert bytes to samples based upon the provided format */
+static inline size_t bytes_to_samples(bladerf_format format, size_t n)
+{
+    switch (format) {
+        case BLADERF_FORMAT_SC16_Q11:
+        case BLADERF_FORMAT_SC16_Q11_META:
+            return bytes_to_sc16q11(n);
+
+        default:
+            assert(!"Invalid format");
+            return 0;
+    }
+}
 
 /**
  * Initialize device registers - required after power-up, but safe
  * to call multiple times after power-up (e.g., multiple close and reopens)
  */
-int bladerf_init_device(struct bladerf *dev);
+int init_device(struct bladerf *dev);
 
 /**
+ * Populate the provided timeval structure for the specified timeout
  *
+ * @param[out]  t_abs       Absolute timeout structure to populate
+ * @param[in]   timeout_ms  Desired timeout in ms.
+ *
+ * 0 on success, BLADERF_ERR_UNEXPECTED on failure
  */
-size_t bytes_to_c16_samples(size_t n_bytes);
-size_t c16_samples_to_bytes(size_t n_samples);
-
-
-/**
- * Set an error and type
- */
-void bladerf_set_error(struct bladerf_error *error,
-                        bladerf_error_type type, int val);
+int populate_abs_timeout(struct timespec *t_abs, unsigned int timeout_ms);
 
 /**
- * Fetch an error and type
+ * Load a calibration table and apply its settings
+ *
+ * @param       dev         Device handle
+ * @param       filename    Name (and path) of file to load
+ *
+ * @return 0 on success, BLADERF_ERR_* on failure
  */
-void bladerf_get_error(struct bladerf_error *error,
-                        bladerf_error_type *type, int *val);
+int load_calibration_table(struct bladerf *dev, const char *filename);
 
 /**
- * Read data from one-time-programmabe (OTP) section of flash
+ * Write a to the FPGA configuration GPIOs.
  *
- * @param[in]   dev         Device handle
- * @param[in]   field       OTP field
- * @param[out]  data        Populated with retrieved data
- * @param[in]   data_size   Size of the data to read
+ * @param   dev     Device handle
+ * @param   val     Value to write
  *
- * 0 on success, BLADERF_ERR_* on failure
+ * @return 0 on success, BLADERF_ERR_* on failure
  */
-int bladerf_get_otp_field(struct bladerf *device, char *field,
-                            char *data, size_t data_size);
+int config_gpio_write(struct bladerf *dev, uint32_t val);
 
 /**
- * Read data from calibration ("cal") section of flash
+ * Perform the neccessary device configuration for the specified format
+ * (e.g., enabling/disabling timestamp support), first checking that the
+ * requested format would not conflict with the other module.
  *
- * @param[in]   dev         Device handle
- * @param[in]   field       Cal field
- * @param[out]  data        Populated with retrieved data
- * @param[in]   data_size   Size of the data to read
+ * @param   dev     Device handle
+ * @param   module  Module that is currently being configured
+ * @param   format  Format the module is being configured for
  *
- * 0 on success, BLADERF_ERR_* on failure
+ * @return 0 on success, BLADERF_ERR_* on failure
  */
-int bladerf_get_otp_field(struct bladerf *device, char *field,
-                            char *data, size_t data_size);
+int perform_format_config(struct bladerf *dev, bladerf_module module,
+                          bladerf_format format);
 
 /**
- * Retrieve the device serial from flash and store it in the provided buffer.
+ * Deconfigure and update any state pertaining what a format that a module is no
+ * longer using
  *
- * @pre The provided buffer is BLADERF_SERIAL_LENGTH in size
+ * @param   dev     Device handle
+ * @param   module  Module that is currently being deconfigured
  *
- * @param[inout]   dev      Device handle. On success, serial field is updated
- *
- * 0 on success, BLADERF_ERR_* on failure
+ * @return 0 on success, BLADERF_ERR_* on failure
  */
-int bladerf_read_serial(struct bladerf *device, char *serial_buf);
-
-/**
- * Retrieve VCTCXO calibration value from flash and cache it in the
- * provided device structure
- *
- * @param[inout]   dev      Device handle. On success, trim field is updated
- *
- * 0 on success, BLADERF_ERR_* on failure
- */
-int bladerf_get_and_cache_vctcxo_trim(struct bladerf *device);
-
-/**
- * Retrieve FPGA size variant from flash and cache it in the provided
- * device structure
- *
- * @param[inout]   dev      Device handle.
- *                          On success, fpga_size field  is updated
- *
- * 0 on success, BLADERF_ERR_* on failure
- */
-int bladerf_get_and_cache_fpga_size(struct bladerf *device);
-
-/**
- * Create data that can be read by extract_field()
- *
- * @param[in]   ptr     Pointer to data buffer that will containt encoded data
- * @param[in]   len     Length of data buffer that will containt encoded data
- * @param[inout]   idx  Pointer indicating next free byte inside of data buffer that will containt encoded data
- * @param[in]   field   Key of value to be stored in encoded data buffer
- * @param[in]   val     Value to be stored in encoded data buffer
- *
- * 0 on success, BLADERF_ERR_* on failure
- */
-int encode_field(char *ptr, int len, int *idx, char *field, char *val);
+int perform_format_deconfig(struct bladerf *dev, bladerf_module module);
 
 #endif

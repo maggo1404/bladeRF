@@ -31,6 +31,7 @@
 
 #include "device_identifier.h"
 #include "devinfo.h"
+#include "backend/backend.h"
 #include "conversions.h"
 #include "log.h"
 
@@ -39,7 +40,6 @@
 
 static int handle_backend(char *str, struct bladerf_devinfo *d)
 {
-    int status = 0;
     char *str_end;
 
     if (!str || strlen(str) == 0) {
@@ -48,25 +48,16 @@ static int handle_backend(char *str, struct bladerf_devinfo *d)
 
 
     /* Gobble up any leading whitespace */
-    while (*str && isspace(*str)) {
+    while (*str && isspace((unsigned char) *str)) {
         str++;
     };
 
     /* Likewise for trailing whitespace */
     str_end = str + strlen(str) - 1;
-    while (str_end > str && isspace(*str_end)) { str_end--; };
+    while (str_end > str && isspace((unsigned char) *str_end)) { str_end--; };
     str_end[1] = '\0';
 
-    if (!strcasecmp("libusb", str)) {
-        d->backend = BLADERF_BACKEND_LIBUSB;
-    } else if (!strcasecmp("linux", str)) {
-        d->backend = BLADERF_BACKEND_LINUX;
-    } else {
-        log_error("Invalid backend: %s\n", str);
-        status = BLADERF_ERR_INVAL;
-    }
-
-    return status;
+    return str2backend(str, &d->backend);
 }
 
 static int handle_device(struct bladerf_devinfo *d, char *value)
@@ -87,9 +78,9 @@ static int handle_device(struct bladerf_devinfo *d, char *value)
 
         if (bus_ok && addr_ok) {
             status = 0;
-            log_info("Device: %d:%d\n", d->usb_bus, d->usb_addr);
+            log_debug("Device: %d:%d\n", d->usb_bus, d->usb_addr);
         } else {
-            log_error("Bad bus (%s) or address (%s)\n", bus, addr);
+            log_debug("Bad bus (%s) or address (%s)\n", bus, addr);
         }
     }
 
@@ -102,10 +93,10 @@ static int handle_instance(struct bladerf_devinfo *d, char *value)
 
     d->instance = str2uint(value, 0, DEVINFO_INST_ANY - 1, &ok);
     if (!ok) {
-        log_error("Bad instance: %s\n", value);
+        log_debug("Bad instance: %s\n", value);
         return BLADERF_ERR_INVAL;
     } else {
-        log_info("Instance: %u\n", d->instance);
+        log_debug("Instance: %u\n", d->instance);
         return 0;
     }
 }
@@ -122,10 +113,10 @@ static int handle_serial(struct bladerf_devinfo *d, char *value)
     for (i = 0; i < 32; i++) {
         c = value[i];
         if (c >= 'A' && c <='F') {
-            value[i] = tolower(c);
+            value[i] = tolower((unsigned char) c);
         }
         if ((c < 'a' || c > 'f') && (c < '0' || c > '9')) {
-            log_error("Bad serial: %s\n", value);
+            log_debug("Bad serial: %s\n", value);
             return BLADERF_ERR_INVAL;
         }
     }
@@ -133,7 +124,7 @@ static int handle_serial(struct bladerf_devinfo *d, char *value)
     strncpy(d->serial, value, 32);
     d->serial[32] = 0;
 
-    log_info("Serial 0x%s\n", d->serial);
+    log_debug("Serial 0x%s\n", d->serial);
     return 0;
 }
 

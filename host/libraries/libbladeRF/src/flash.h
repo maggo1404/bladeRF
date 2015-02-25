@@ -31,20 +31,138 @@
 #ifndef BLADERF_FLASH_H_
 #define BLADERF_FLASH_H_
 
-extern const unsigned int BLADERF_FLASH_ALIGNMENT_BYTE;
-extern const unsigned int BLADERF_FLASH_ALIGNMENT_PAGE;
-extern const unsigned int BLADERF_FLASH_ALIGNMENT_SECTOR;
+/**
+ * Test if a flash access is valid, based upon the specified alignment
+ * and whether the access extends past the end of available flash.
+ *
+ * Valid values for the alignment parameters are the FLASH_ALIGNMENT_* macros.
+ *
+ * @param   addr_align  Address aligment
+ * @param   len_align   Length alignment
+ * @param   addr        Flash byte address
+ * @param   len         Length of the access
+ *
+ * @return true on a valid acesss, false otherwise
+ */
+bool flash_is_valid_access(uint32_t addr_align, uint32_t len_align,
+                           uint32_t addr, size_t len);
 
-/* Pass one of the BLADERF_FLASH_ALIGNMENT_* constants as `align' */
-int flash_aligned(unsigned int align, unsigned int addr);
-int flash_bounds(unsigned int addr, unsigned int len);
-int flash_bounds_aligned(unsigned int align,
-                         unsigned int addr, unsigned int len);
+/**
+ * Convert a byte address to an erase block.
+ *
+ * @pre Bytes address is erase block-aligned.
+ *
+ * @param   byte_addr   Byte address
+ *
+ * @return  Erase block number
+ */
+uint16_t flash_bytes_to_eb(uint32_t byte_addr);
 
-unsigned int flash_to_sectors(unsigned int bytes);
-unsigned int flash_to_pages(unsigned int bytes);
+/**
+ * Convert a byte address to a page.
+ *
+ * @pre Byte address is page-aligned.
+ *
+ * @param   byte_addr   Byte address
+ *
+ * @return Page number
+ */
+uint16_t flash_bytes_to_pages(uint32_t byte_addr);
 
-unsigned int flash_from_pages(unsigned int page);
-unsigned int flash_from_sectors(unsigned int sector);
+/**
+ * Convert a page number to a byte address
+ *
+ * @param   page    Page number
+ * @return  byte address
+ */
+uint32_t flash_pages_to_bytes(uint16_t page);
+
+/**
+ * Convert an erase block number to a byte address
+ *
+ * @param   eb  Erase block number
+ * @return  byte address
+ */
+uint32_t flash_eb_to_bytes(unsigned int eb);
+
+/**
+ * Erase regions of SPI flash
+ *
+ * @param   dev             Device handle
+ * @param   erase_block     Erase block to start erasing at
+ * @param   count           Number of blocks to erase.
+ *
+ * @return 0 on success, or BLADERF_ERR_INVAL on an invalid `erase_block` or
+ *         `count` value, or a value from \ref RETCODES list on other failures
+ */
+int flash_erase(struct bladerf *dev, uint32_t erase_block, uint32_t count);
+
+/**
+ * Read data from flash
+ *
+ * @param   dev     Device handle
+ * @param   buf     Buffer to read data into. Must be
+ *                  `count` * BLADERF_FLASH_PAGE_SIZE bytes or larger.
+ *
+ * @param   page    Page to begin reading from
+ * @param   count   Number of pages to read
+ *
+ * @return 0 on success, or BLADERF_ERR_INVAL on an invalid `page` or
+ *         `count` value, or a value from \ref RETCODES list on other failures.
+ */
+int flash_read(struct bladerf *dev, uint8_t *buf,
+               uint32_t page, uint32_t count);
+/**
+ * Write data to flash
+ *
+ * @param   dev   Device handle
+ * @param   buf   Data to write to flash. Must be
+ *                `page` * BLADERF_FLASH_PAGE_SIZE bytes or larger.
+ *
+ * @param   page  Page to begin writing at
+ * @param   count
+ *
+ * @return 0 on success, or BLADERF_ERR_INVAL on an invalid `page` or
+ *         `count` value, or a value from \ref RETCODES list on other failures.
+ */
+int flash_write(struct bladerf *dev, const uint8_t *buf,
+                uint32_t page, uint32_t count);
+
+/**
+ * Write the provided data to the FX3 Firmware region to flash.
+ *
+ * This function does no validation of the data (i.e., that it's valid FW).
+ *
+ * @param   dev             bladeRF handle
+ * @param   image           Firmware image data. Buffer will be
+ *                          realloc'd as needed to pad the image data.
+ * @param   len             Length of firmware to write, in bytes
+ *
+ * @return 0 on success, BLADERF_ERR_* value on failure
+ */
+int flash_write_fx3_fw(struct bladerf *dev, uint8_t **image, size_t len);
+
+/**
+ * Write the provided FPGA bitstream to flash and enable autoloading via
+ * writing the associated metadata.
+ *
+ * @param   dev             bladeRF handle
+ * @param   bitstream       FPGA bitstream data. Buffer will be realloc'd as
+ *                          needed to pad the image data.
+ * @param   len             Length of the bitstream data
+ *
+ * @return 0 on success, BLADERF_ERR_* value on failure
+ */
+int flash_write_fpga_bitstream(struct bladerf *dev,
+                               uint8_t **bitstream, size_t len);
+
+/**
+ * Erase FPGA metadata and bitstream regions of flash
+ *
+ * @param   dev             bladeRF handle
+ *
+ * @return 0 on success, BLADERF_ERR_* value on failure
+ */
+int flash_erase_fpga(struct bladerf *dev);
 
 #endif

@@ -1,7 +1,7 @@
 /*
  * This file is part of the bladeRF project
  *
- * Copyright (C) 2013 Nuand LLC
+ * Copyright (C) 2013-2014 Nuand LLC
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -29,34 +29,33 @@ int cmd_info(struct cli_state *state, int argc, char **argv)
     bool fpga_loaded;
     struct bladerf_devinfo info;
     bladerf_dev_speed usb_speed;
-
-    if (!cli_device_is_opened(state)) {
-        return CMD_RET_NODEV;
-    }
+    const char *backend_str;
 
     status = bladerf_get_devinfo(state->dev, &info);
     if (status < 0) {
         state->last_lib_error = status;
-        return CMD_RET_LIBBLADERF;
+        return CLI_RET_LIBBLADERF;
     }
+
+    backend_str = backend_description(info.backend);
 
     status = bladerf_is_fpga_configured(state->dev);
     if (status < 0) {
         state->last_lib_error = status;
-        return CMD_RET_LIBBLADERF;
+        return CLI_RET_LIBBLADERF;
     }
     fpga_loaded = status != 0;
 
     status = bladerf_get_fpga_size(state->dev, &fpga_size);
     if (status < 0) {
         state->last_lib_error = status;
-        return CMD_RET_LIBBLADERF;
+        return CLI_RET_LIBBLADERF;
     }
 
     status = bladerf_get_vctcxo_trim(state->dev, &dac_trim);
     if (status < 0) {
         state->last_lib_error = status;
-        return CMD_RET_LIBBLADERF;
+        return CLI_RET_LIBBLADERF;
     }
 
     usb_speed = bladerf_device_speed(state->dev);
@@ -73,19 +72,7 @@ int cmd_info(struct cli_state *state, int argc, char **argv)
     printf("  USB bus:                  %d\n", info.usb_bus);
     printf("  USB address:              %d\n", info.usb_addr);
     printf("  USB speed:                %s\n", devspeed2str(usb_speed));
-
-    switch(info.backend) {
-        case BLADERF_BACKEND_LIBUSB:
-            printf("  Backend:                  libusb\n");
-            break;
-
-        case BLADERF_BACKEND_LINUX:
-            printf("  Backend:                  Linux driver\n");
-            break;
-
-        default:
-            printf("  Backend:                  Unknown\n");
-    }
+    printf("  Backend:                  %s\n", backend_str);
     printf("  Instance:                 %d\n", info.instance);
 
     printf("\n");

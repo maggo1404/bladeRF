@@ -57,6 +57,7 @@
 #define BLADE_USB_CMD_END_PROG                  3
 #define BLADE_USB_CMD_RF_RX                     4
 #define BLADE_USB_CMD_RF_TX                     5
+#define BLADE_USB_CMD_QUERY_DEVICE_READY        6
 #define BLADE_USB_CMD_FLASH_READ              100
 #define BLADE_USB_CMD_FLASH_WRITE             101
 #define BLADE_USB_CMD_FLASH_ERASE             102
@@ -70,6 +71,8 @@
 #define BLADE_USB_CMD_READ_CAL_CACHE          110
 #define BLADE_USB_CMD_INVALIDATE_CAL_CACHE    111
 #define BLADE_USB_CMD_REFRESH_CAL_CACHE       112
+#define BLADE_USB_CMD_SET_LOOPBACK            113
+#define BLADE_USB_CMD_GET_LOOPBACK            114
 
 /* String descriptor indices */
 #define BLADE_USB_STR_INDEX_MFR     1   /* Manufacturer */
@@ -126,6 +129,13 @@ struct bladeRF_sector {
 #define NUM_CONCURRENT  8
 #define NUM_DATA_URB    (1024)
 #define DATA_BUF_SZ     (1024*4)
+
+#define UART_PKT_DEV_GPIO_ADDR          0
+#define UART_PKT_DEV_RX_GAIN_ADDR       4
+#define UART_PKT_DEV_RX_PHASE_ADDR      6
+#define UART_PKT_DEV_TX_GAIN_ADDR       8
+#define UART_PKT_DEV_TX_PHASE_ADDR      10
+#define UART_PKT_DEV_FGPA_VERSION_ID    12
 
 struct uart_pkt {
     unsigned char magic;

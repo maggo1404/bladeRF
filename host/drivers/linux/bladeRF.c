@@ -44,30 +44,48 @@ typedef struct {
     int                   intnum;
     int                   disconnecting;
 
+    //    0   1   2   3   4   5   6   7   8   9   10  11  12  13  14  15
+    //  |   |   |   | X | X | X | X | X | S | S | S | S |   |   |   |   |
+    //                ^                   ^               ^ producer index
+    //                consumer index      receive index
+    //  Key: S=submitted  X=unsubmitted, queued buffers
+
     int                   rx_en;
     spinlock_t            data_in_lock;
+
     unsigned int          data_in_consumer_idx;
+    unsigned int          data_in_receiver_idx;
     unsigned int          data_in_producer_idx;
-    atomic_t              data_in_cnt;          // number of buffers with data unread by the usermode application
-    atomic_t              data_in_used;         // number of buffers that may be inflight or have unread data
-    atomic_t              data_in_inflight;     // number of buffers currently in the USB stack
+
+    atomic_t              data_in_queued;       // number of buffers with data unread by the usermode application [transmit index - transmit index]
+    atomic_t              data_in_used;         // number of buffers that may be inflight or have unread data [transmit index - consumer index]
+    atomic_t              data_in_inflight;     // number of buffers currently in the USB stack [transmit index - consumer index]
     struct data_buffer    data_in_bufs[NUM_DATA_URB];
     struct usb_anchor     data_in_anchor;
     wait_queue_head_t     data_in_wait;
 
+
+    //    0   1   2   3   4   5   6   7   8   9   10  11  12  13  14  15
+    //  |   |   |   | S | S | S | S | X | X | X | X | X |   |   |   |   |
+    //                ^               ^ consumer index    ^ producer index
+    //                | transmit index
+    //  Key: S=submitted  X=unsubmitted, queued buffers
+
     int                   tx_en;
     spinlock_t            data_out_lock;
+
     unsigned int          data_out_consumer_idx;
+    unsigned int          data_out_tranmit_idx;
     unsigned int          data_out_producer_idx;
-    atomic_t              data_out_cnt;
+
+    atomic_t              data_out_queued;
     atomic_t              data_out_used;
     atomic_t              data_out_inflight;
     struct data_buffer    data_out_bufs[NUM_DATA_URB];
     struct usb_anchor     data_out_anchor;
     wait_queue_head_t     data_out_wait;
 
-    struct semaphore      config_sem;
-
+    // allow only one reader and writer
     struct file           *reader, *writer;
 
     int bytes;
@@ -86,29 +104,34 @@ MODULE_DEVICE_TABLE(usb, bladerf_table);
 static int __submit_rx_urb(bladerf_device_t *dev, unsigned int flags) {
     struct urb *urb;
     unsigned long irq_flags;
-    int ret;
+    int ret = 0;
 
-    ret = 0;
-    while (atomic_read(&dev->data_in_inflight) < NUM_CONCURRENT && atomic_read(&dev->data_in_used) < NUM_DATA_URB) {
+    do {
         spin_lock_irqsave(&dev->data_in_lock, irq_flags);
-        urb = dev->data_in_bufs[dev->data_in_producer_idx].urb;
+        if (atomic_read(&dev->data_in_inflight) < NUM_CONCURRENT && atomic_read(&dev->data_in_used) < NUM_DATA_URB) {
+            urb = dev->data_in_bufs[dev->data_in_producer_idx].urb;
 
-        if (!dev->data_in_bufs[dev->data_in_producer_idx].valid) {
+            if (!dev->data_in_bufs[dev->data_in_producer_idx].valid) {
+                printk("data_in error\n");
+                break;
+            }
+
+            dev->data_in_bufs[dev->data_in_producer_idx].valid = 0; // mark this RX packet as being in use
+
+            atomic_inc(&dev->data_in_used);
+
+            usb_anchor_urb(urb, &dev->data_in_anchor);
             spin_unlock_irqrestore(&dev->data_in_lock, irq_flags);
-            // break;
+            atomic_inc(&dev->data_in_inflight);
+            ret = usb_submit_urb(urb, GFP_ATOMIC);
+            if (ret) {
+                atomic_dec(&dev->data_in_inflight);
+                goto leave_rx;
+            }
         }
-
-        dev->data_in_bufs[dev->data_in_producer_idx].valid = 0; // mark this RX packet as being in use
-
-        dev->data_in_producer_idx++;
-        dev->data_in_producer_idx &= (NUM_DATA_URB - 1);
-        atomic_inc(&dev->data_in_inflight);
-        atomic_inc(&dev->data_in_used);
-
-        usb_anchor_urb(urb, &dev->data_in_anchor);
-        spin_unlock_irqrestore(&dev->data_in_lock, irq_flags);
-        ret = usb_submit_urb(urb, GFP_ATOMIC);
-    }
+    } while(1);
+    spin_unlock_irqrestore(&dev->data_in_lock, irq_flags);
+leave_rx:
 
     return ret;
 }
@@ -117,13 +140,17 @@ static void __bladeRF_write_cb(struct urb *urb);
 static void __bladeRF_read_cb(struct urb *urb) {
     bladerf_device_t *dev;
     unsigned char *buf;
+    unsigned long flags;
 
+    usb_unanchor_urb(urb);
+
+    spin_lock_irqsave(&dev->data_in_lock, flags);
     buf = (unsigned char *)urb->transfer_buffer;
     dev = (bladerf_device_t *)urb->context;
-    usb_unanchor_urb(urb);
     atomic_dec(&dev->data_in_inflight);
     dev->bytes += DATA_BUF_SZ;
-    atomic_inc(&dev->data_in_cnt);
+    atomic_inc(&dev->data_in_queued);
+    spin_unlock_irqrestore(&dev->data_in_lock, flags);
 
     if (dev->rx_en)
         __submit_rx_urb(dev, GFP_ATOMIC);
@@ -136,7 +163,7 @@ static int bladerf_start(bladerf_device_t *dev) {
     struct urb *urb;
 
     dev->rx_en = 0;
-    atomic_set(&dev->data_in_cnt, 0);
+    atomic_set(&dev->data_in_queued, 0);
     atomic_set(&dev->data_in_used, 0);
     dev->data_in_consumer_idx = 0;
     dev->data_in_producer_idx = 0;
@@ -169,7 +196,7 @@ static int bladerf_start(bladerf_device_t *dev) {
     }
 
     dev->tx_en = 0;
-    atomic_set(&dev->data_out_cnt, 0);
+    atomic_set(&dev->data_out_queued, 0);
     atomic_set(&dev->data_out_used, 0);
 
     dev->data_out_consumer_idx = 0;
@@ -275,7 +302,7 @@ static int disable_rx(bladerf_device_t *dev) {
         goto err_out;
 
     ret = 0;
-    atomic_set(&dev->data_in_cnt, 0);
+    atomic_set(&dev->data_in_queued, 0);
     atomic_set(&dev->data_in_used, 0);
     dev->data_in_consumer_idx = 0;
     dev->data_in_producer_idx = 0;
@@ -322,7 +349,6 @@ static ssize_t bladerf_read(struct file *file, char __user *buf, size_t count, l
     ssize_t ret = 0;
     bladerf_device_t *dev;
     unsigned long flags;
-    int read;
 
     dev = (bladerf_device_t *)file->private_data;
     if (dev->intnum != 1) {
@@ -344,17 +370,13 @@ static ssize_t bladerf_read(struct file *file, char __user *buf, size_t count, l
             return -EINVAL;
         }
     }
-    read = 0;
 
-    while (!read) {
-        int reread;
-        reread = atomic_read(&dev->data_in_cnt);
-
-        if (reread) {
+    do {
+        spin_lock_irqsave(&dev->data_in_lock, flags);
+        if (atomic_read(&dev->data_in_queued)) {
             unsigned int idx;
 
-            spin_lock_irqsave(&dev->data_in_lock, flags);
-            atomic_dec(&dev->data_in_cnt);
+            atomic_dec(&dev->data_in_queued);
             atomic_dec(&dev->data_in_used);
             idx = dev->data_in_consumer_idx++;
             dev->data_in_consumer_idx &= (NUM_DATA_URB - 1);
@@ -367,15 +389,14 @@ static ssize_t bladerf_read(struct file *file, char __user *buf, size_t count, l
                 ret = 0;
             }
 
-
             dev->data_in_bufs[idx].valid = 1; // mark this RX packet as free
 
             // in case all of the buffers were full, rx needs to be restarted
             // samples may have also been dropped if this happens because the user-mode
             // application is not reading samples fast enough
+
             if (atomic_read(&dev->data_in_inflight) == 0)
                 __submit_rx_urb(dev, 0);
-
 
             if (!ret)
                 ret = DATA_BUF_SZ;
@@ -383,7 +404,9 @@ static ssize_t bladerf_read(struct file *file, char __user *buf, size_t count, l
             break;
 
         } else {
-            ret = wait_event_interruptible_timeout(dev->data_in_wait, atomic_read(&dev->data_in_cnt), 2 * HZ);
+            spin_unlock_irqrestore(&dev->data_in_lock, flags);
+            ret = wait_event_interruptible(dev->data_in_wait, atomic_read(&dev->data_in_queued));
+            spin_lock_irqsave(&dev->data_in_lock, flags);
             if (ret < 0) {
                 break;
             } else if (ret == 0) {
@@ -393,7 +416,8 @@ static ssize_t bladerf_read(struct file *file, char __user *buf, size_t count, l
                 ret = 0;
             }
         }
-    }
+    } while (1);
+    spin_unlock_irqrestore(&dev->data_in_lock, flags);
 
     return ret;
 }
@@ -405,32 +429,38 @@ static int __submit_tx_urb(bladerf_device_t *dev) {
 
     int ret = 0;
 
-    while (atomic_read(&dev->data_out_inflight) < NUM_CONCURRENT && atomic_read(&dev->data_out_cnt)) {
+    do {
         spin_lock_irqsave(&dev->data_out_lock, flags);
-        db = &dev->data_out_bufs[dev->data_out_consumer_idx];
-        urb = db->urb;
+        if (atomic_read(&dev->data_out_inflight) < NUM_CONCURRENT && atomic_read(&dev->data_out_queued)) {
+            db = &dev->data_out_bufs[dev->data_out_consumer_idx];
+            urb = db->urb;
 
-        if (!db->valid) {
-            spin_unlock_irqrestore(&dev->data_out_lock, flags);
-            // break;
-        }
+            if (!db->valid) {
+                // if it is not yet valid, it will be when bladerf_write calls __submit_tx_urb
+                break;
+            }
 
-        // clear this packet's valid flag so it is not submitted until the next time it
-        // is used and copy_from_user() has copied data into the buffer
-        db->valid = 0;
-        dev->data_out_consumer_idx++;
-        dev->data_out_consumer_idx &= (NUM_DATA_URB - 1);
+            // clear this packet's valid flag so it is not submitted until the next time it
+            // is used and copy_from_user() has copied data into the buffer
+            db->valid = 0;
+            dev->data_out_consumer_idx++;
+            dev->data_out_consumer_idx &= (NUM_DATA_URB - 1);
 
-        atomic_dec(&dev->data_out_cnt);
+            atomic_dec(&dev->data_out_queued);
 
-        usb_anchor_urb(urb, &dev->data_out_anchor);
-        spin_unlock_irqrestore(&dev->data_out_lock, flags);
-        ret = usb_submit_urb(urb, GFP_ATOMIC);
-        if (!ret)
+            usb_anchor_urb(urb, &dev->data_out_anchor);
             atomic_inc(&dev->data_out_inflight);
-        else
-            break;
-    }
+            spin_unlock_irqrestore(&dev->data_out_lock, flags);
+
+            ret = usb_submit_urb(urb, GFP_ATOMIC);
+            if (ret) {
+                atomic_dec(&dev->data_out_inflight);
+                goto leave_tx;
+            }
+        } else break;
+    } while (1);
+    spin_unlock_irqrestore(&dev->data_out_lock, flags);
+leave_tx:
 
     return ret;
 }
@@ -438,13 +468,19 @@ static int __submit_tx_urb(bladerf_device_t *dev) {
 static void __bladeRF_write_cb(struct urb *urb)
 {
     bladerf_device_t *dev;
+    unsigned long flags;
 
     dev = (bladerf_device_t *)urb->context;
 
     usb_unanchor_urb(urb);
 
+    spin_lock_irqsave(&dev->data_out_lock, flags);
+
     atomic_dec(&dev->data_out_inflight);
     atomic_dec(&dev->data_out_used);
+
+    spin_unlock_irqrestore(&dev->data_out_lock, flags);
+
     if (dev->tx_en)
         __submit_tx_urb(dev);
     dev->bytes += DATA_BUF_SZ;
@@ -465,6 +501,7 @@ static ssize_t bladerf_write(struct file *file, const char *user_buf, size_t cou
 
     dev = (bladerf_device_t *)file->private_data;
 
+    // special exception for loading FPGA
     if (dev->intnum == 0) {
         int llen;
         buf = (char *)kmalloc(count, GFP_KERNEL);
@@ -495,7 +532,7 @@ static ssize_t bladerf_write(struct file *file, const char *user_buf, size_t cou
 
     reread = atomic_read(&dev->data_out_used);
     if (reread >= NUM_DATA_URB) {
-        status = wait_event_interruptible_timeout(dev->data_out_wait, atomic_read(&dev->data_out_used) < NUM_DATA_URB, 2 * HZ);
+        status = wait_event_interruptible(dev->data_out_wait, atomic_read(&dev->data_out_used) < NUM_DATA_URB);
 
         if (status < 0) {
             return status;
@@ -509,7 +546,7 @@ static ssize_t bladerf_write(struct file *file, const char *user_buf, size_t cou
     idx = dev->data_out_producer_idx++;
     dev->data_out_producer_idx &= (NUM_DATA_URB - 1);
     db = &dev->data_out_bufs[idx];
-    atomic_inc(&dev->data_out_cnt);
+    atomic_inc(&dev->data_out_queued);
     atomic_inc(&dev->data_out_used);
 
     spin_unlock_irqrestore(&dev->data_out_lock, flags);

@@ -30,9 +30,10 @@
 #include <libbladeRF.h>
 #include "cmd.h"
 #include "conversions.h"
+#include "thread.h"
 
 #define RXTX_ERRMSG_VALUE(param, value) \
-    "Invalid value for \"%s\" (%s)", param, value
+    "Invalid value for \"%s\" (%s)\n", param, value
 
 /* Minimum required unit of sample acceses */
 #define LIBBLADERF_SAMPLE_BLOCK_SIZE    1024
@@ -54,8 +55,8 @@
 
 enum rxtx_fmt {
     RXTX_FMT_INVALID = -1,
-    RXTX_FMT_CSV_SC16Q12,   /* CSV (Comma-separated, one entry per line) */
-    RXTX_FMT_BIN_SC16Q12    /* Binary (big-endian), c16 I,Q */
+    RXTX_FMT_CSV_SC16Q11,   /* CSV (Comma-separated, one entry per line) */
+    RXTX_FMT_BIN_SC16Q11    /* Binary (big-endian), c16 I,Q */
 };
 
 enum rxtx_state {
@@ -75,16 +76,12 @@ enum rxtx_state {
  * should be acquired first.*/
 struct data_mgmt
 {
-    /* These two items should not be modified outside of the running task */
-    struct bladerf_stream *stream;  /* Stream handle */
-    void **buffers;                 /* SC16 Q12 sample buffers*/
-    size_t next_idx;                /* Index of next buffer to use */
-
-    pthread_mutex_t lock;           /* Should be acquired to change the
+    MUTEX lock;                     /* Should be acquired to change the
                                      *    the following items */
-    size_t num_buffers;             /* # of buffers in 'buffers' list */
-    size_t samples_per_buffer;      /* Size of each buffer (in samples) */
-    size_t num_transfers;           /* # of transfers to use in the stream */
+    unsigned int num_buffers;       /* # of buffers in 'buffers' list */
+    unsigned int samples_per_buffer;/* Size of each buffer (in samples) */
+    unsigned int num_transfers;     /* # of transfers to use in the stream */
+    unsigned int timeout_ms;        /* Stream timeout, in ms */
 };
 
 /* Input/Ouput file and related metadata.
@@ -92,10 +89,10 @@ struct data_mgmt
 struct file_mgmt
 {
     FILE *file;                 /* File to read/write samples from/to */
-    pthread_mutex_t file_lock;  /* Thread using 'file' must hold this lock */
+    MUTEX file_lock;            /* Thread using 'file' must hold this lock */
 
 
-    pthread_mutex_t file_meta_lock; /* Should be acquired when accessing any
+    MUTEX file_meta_lock;           /* Should be acquired when accessing any
                                      * of the following file metadata items */
     char *path;                     /* Path associated with 'file'. */
     enum rxtx_fmt format;           /* File format */
@@ -106,11 +103,12 @@ struct file_mgmt
 struct task_mgmt
 {
     pthread_t thread;           /* Handle to thread in which the task runs */
+    bool started;               /* Has the thread been started? */
 
     enum rxtx_state state;      /* Task state */
     uint8_t req;                /* Requests for state change. See
                                  *   RXTX_TASK_REQ_* bitmasks */
-    pthread_mutex_t lock;       /* Must be held to access 'req' or 'state' */
+    MUTEX lock;                 /* Must be held to access 'req' or 'state' */
     pthread_cond_t signal_req;  /* Signal when a request has been made */
     pthread_cond_t signal_done; /* Signal when task finishes work */
     pthread_cond_t signal_state_change; /* Signal after state change */
@@ -129,7 +127,8 @@ struct rxtx_data
     struct task_mgmt task_mgmt;
     struct cli_error last_error;
 
-    pthread_mutex_t param_lock; /* Must be held to access the following items */
+    /* Must be held to access the following items */
+    MUTEX param_lock;
     void *params;
 };
 
@@ -142,6 +141,7 @@ struct tx_params
 struct rx_params
 {
     size_t n_samples;           /* Number of samples to receive */
+    int (*write_samples)(struct rxtx_data *rx, int16_t *samples, size_t n);
 };
 
 /* Multipliers in units of 1024 */
@@ -179,7 +179,7 @@ enum rxtx_state rxtx_get_state(struct rxtx_data *rxtx);
  * @param   rxtx    RX/TX data handle
  * @param   path    Path to set
  *
- * @return 0 on success, CMD_RET_MEM on memory allocation error
+ * @return 0 on success, CLI_RET_MEM on memory allocation error
  */
 int rxtx_set_file_path(struct rxtx_data *rxtx, const char *path);
 
@@ -282,8 +282,8 @@ unsigned char rxtx_get_requests(struct rxtx_data *rxtx, unsigned char mask);
  * @param[out]      val         Set to point to value portion of parameter
  *
  * @return 0 if the param was not handled, 1 if it was,
- *         CMD_RET_* if an error occurs. This function will print an error
- *         for CMD_RET_INVALID. param and val are undefined for an error.
+ *         CLI_RET_* if an error occurs. This function will print an error
+ *         for CLI_RET_INVALID. param and val are undefined for an error.
  */
 int rxtx_handle_config_param(struct cli_state *s, struct rxtx_data *rxtx,
                              const char *argv0, char *param, char **val);
@@ -299,7 +299,7 @@ int rxtx_handle_config_param(struct cli_state *s, struct rxtx_data *rxtx,
  * @param   argc    Number of pararamters provided to rx/tx command
  * @param   argc    Pararamters provided to rx/tx command
  *
- * @return 0 on success, CMD_RET_* for any errors
+ * @return 0 on success, CLI_RET_* for any errors
  */
 int rxtx_handle_wait(struct cli_state *s, struct rxtx_data *rxtx,
                      int argc, char **argv);
@@ -311,8 +311,8 @@ int rxtx_handle_wait(struct cli_state *s, struct rxtx_data *rxtx,
  * @param[in]       rxtx        RX/TX data handle
  * @param[in]       argv0       argv[0] string (used to prefix error messages)
  *
- * @return 0 on success, CMD_RET_* for any errors. An error will be printed
- *         for CMD_RET_INVPARAM
+ * @return 0 on success, CLI_RET_* for any errors. An error will be printed
+ *         for CLI_RET_INVPARAM
  */
 int rxtx_cmd_start_check(struct cli_state *s, struct rxtx_data *rxtx,
                          const char *argv0);
@@ -336,18 +336,17 @@ void rxtx_task_exec_idle(struct rxtx_data *rxtx, unsigned char *requests);
  * Handle the rx/tx task's RUNNING state
  *
  * @param   rxtx        RX/TX data handle
+ * @param   s           CLI state handle
  */
-void rxtx_task_exec_running(struct rxtx_data *rxtx);
+void rxtx_task_exec_running(struct rxtx_data *rxtx, struct cli_state *s);
 
 /**
  * Handle the rx/tx task's STOP state
  *
  * @param   rxtx        RX/TX data handle
  * @param   requests    Task's copy of pending requests
- * @param   dev         device handle
  */
-void rxtx_task_exec_stop(struct rxtx_data *rxtx, unsigned char *requests,
-                         struct bladerf *dev);
+void rxtx_task_exec_stop(struct rxtx_data *rxtx, unsigned char *requests);
 
 /**
  * Wait for a task to transition into the specified state

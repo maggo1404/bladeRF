@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 2.8.4)
 project(bladeRF C)
 
 ################################################################################
@@ -9,6 +9,8 @@ project(bladeRF C)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/output)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/output)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/output)
+set(CMAKE_HELPERS_BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/cmake/helpers)
+set(CMAKE_HELPERS_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/cmake/helpers)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE "Release")
@@ -29,16 +31,23 @@ set(BLADERF_HOST_COMMON_INCLUDE_DIRS
 
 set(BLADERF_HOST_COMMON_SOURCE_DIR ${CMAKE_CURRENT_LIST_DIR}/common/src)
 
+# CMake >= 2.8.4 no longer defines WIN32. Acknowledge this change.
+set(CMAKE_LEGACY_CYGWIN_WIN32 0)
+
 ###############################
 # Misc. options
 ###############################
 option(ENABLE_LOG_FILE_INFO
         "Enable source file and line number information in log messages."
-        OFF)
+        ON)
 
 option(BUILD_DOCUMENTATION
         "Enable build and install of manpages and other documentation."
         OFF)
+
+option(TREAT_WARNINGS_AS_ERRORS
+       "Treat compiler warnings as errors."
+       ON)
 
 if(ENABLE_LOG_FILE_INFO)
     add_definitions(-DLOG_INCLUDE_FILE_INFO)
@@ -47,11 +56,14 @@ endif()
 ################################################################################
 # Configure host-specific items
 ################################################################################
-configure_file(
-    ${CMAKE_CURRENT_SOURCE_DIR}/common/include/host_config.h.in
-    ${CMAKE_CURRENT_BINARY_DIR}/common/include/host_config.h
-    @ONLY
-)
+include(TestBigEndian)
+TEST_BIG_ENDIAN(BLADERF_BIG_ENDIAN)
+
+# Search for libraries and drivers
+include(FindLibUSB)
+if(WIN32)
+    include(FindCyAPI)
+endif()
 
 ################################################################################
 # Compiler configuration
@@ -80,15 +92,13 @@ endif()
 if("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" OR
    "${CMAKE_C_COMPILER_ID}" STREQUAL "Clang")
 
-    # Prefer more warnings, enforce C89 so folks developing in Linux can keep
-    # an eye on stuff that will likely cause portability issues
     add_definitions(-Wall)
     add_definitions(-Wextra)
-# TODO Re-enable these
-#    add_definitions(-pedantic)
-#    add_definitions(-std=c89)
-    add_definitions(-Werror)
     add_definitions(-Wno-unused-parameter)
+
+    if(TREAT_WARNINGS_AS_ERRORS)
+        add_definitions(-Werror)
+    endif()
 
     if("${CMAKE_BUILD_TYPE}" STREQUAL "Debug")
         add_definitions(-DDEBUG=1)
@@ -102,7 +112,15 @@ endif("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" OR
 # MS Visual Studio
 ###############################
 if(MSVC)
-    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /WX")
+    if(TREAT_WARNINGS_AS_ERRORS)
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} /WX")
+    endif()
+
+    # Prior to V12.0 2013, certain C99 headers we use were not supported.
+    # We have to supply our own.
+    if(MSVC_VERSION LESS 1800)
+        set(MSVC_C99_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/common/include/windows/c99)
+    endif()
 endif(MSVC)
 
 ################################################################################
@@ -110,10 +128,32 @@ endif(MSVC)
 ################################################################################
 
 # Linux (TODO determine if this will actually be sufficient for BSD)
-if(${CMAKE_SYSTEM_NAME} MATCHES "Linux" OR ${CMAKE_SYSTEM_NAME} MATCHES "BSD")
+if(${CMAKE_SYSTEM_NAME} MATCHES "Linux" OR ${CMAKE_SYSTEM_NAME} MATCHES "BSD" OR CYGWIN)
     set(BLADERF_OS_LINUX 1)
+
+    if(NOT CMAKE_CROSSCOMPILING AND NOT CYGWIN)
+        message(STATUS "Checking libc version...")
+        try_run(LIBC_VERSION_RUN_RESULT LIBC_VERSION_COMPILE_RESULT
+                ${CMAKE_HELPERS_BINARY_DIR}
+                ${CMAKE_HELPERS_SOURCE_DIR}/libc_version.c
+                RUN_OUTPUT_VARIABLE LIBC_VERSION)
+
+        if(LIBC_VERSION)
+            message(STATUS "libc version: ${LIBC_VERSION}")
+        else()
+            message(WARNING "Unable to determine libc version")
+        endif()
+    endif(NOT CMAKE_CROSSCOMPILING AND NOT CYGWIN)
+
 elseif(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     set(BLADERF_OS_OSX 1)
+
+    # We also need to add some headers that the system will not provide
+    set(BLADERF_HOST_COMMON_INCLUDE_DIRS
+            ${BLADERF_HOST_COMMON_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_LIST_DIR}/common/include/osx
+    )
+
 elseif(${CMAKE_SYSTEM_NAME} MATCHES "Windows")
     set(BLADERF_OS_WINDOWS 1)
 
@@ -136,8 +176,15 @@ configure_file(
 
 # OSX
 if(APPLE)
-   set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
-   set(CMAKE_INSTALL_NAME_DIR ${CMAKE_INSTALL_PREFIX}/lib)
+    set(CMAKE_MACOSX_RPATH ON)
+    set(CMAKE_SKIP_BUILD_RPATH FALSE)
+    set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
+    set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+    set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
+    list(FIND CMAKE_PLATFORM_IMPLICIT_LINK_DIRECTORIES "${CMAKE_INSTALL_PREFIX}/lib" isSystemDir)
+    if("${isSystemDir}" STREQUAL "-1")
+        set(CMAKE_INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
+    endif()
 endif()
 
 ################################################################################
@@ -163,11 +210,20 @@ add_custom_target(uninstall
 ################################################################################
 # Windows-only, Post build: Copy libraries to our build output directory
 ################################################################################
-if(WIN32)
+if(WIN32 AND NOT CMAKE_CROSSCOMPILING)
     find_package(LibPThreadsWin32)
     if(LIBPTHREADSWIN32_FOUND)
-        set(WIN_POSTBUILD_ITEMS ${WIN_POSTBUILD_ITEMS}
+        set(WIN_RUNTIME_ITEMS ${WIN_RUNTIME_ITEMS}
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/pthreads-win32/COPYING.LIB.txt"
                 "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/pthreadVC2.dll")
+
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/pthreads-win32/COPYING.LIB.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${LIBPTHREADSWIN32_LIB_COPYING}"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/pthreads-win32/COPYING.LIB.txt"
+            COMMENT "Copying pthreads-win32 license to output directory..."
+        )
 
         add_custom_command(
             OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/pthreadVC2.dll"
@@ -178,10 +234,21 @@ if(WIN32)
         )
     endif(LIBPTHREADSWIN32_FOUND)
 
-    find_package(LibUsb)
     if(LIBUSB_FOUND)
-        set(WIN_POSTBUILD_ITEMS ${WIN_POSTBUILD_ITEMS}
+        set(WIN_RUNTIME_ITEMS ${WIN_RUNTIME_ITEMS}
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/libusb/COPYING"
             "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/libusb-1.0.dll")
+
+        # The libusb Windows release does not appear to include a COPYING file.
+        # Since it's LGPLv2.1, we'll copy the equivalent license from our
+        # license directory
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/libusb/COPYING"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.LGPLv2.1"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/libusb/COPYING"
+            COMMENT "Copying libusb license to output directory..."
+        )
 
         add_custom_command(
             OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/libusb-1.0.dll"
@@ -192,6 +259,134 @@ if(WIN32)
         )
     endif(LIBUSB_FOUND)
 
-    add_custom_target(win_postbuild ALL DEPENDS ${WIN_POSTBUILD_ITEMS})
+    if(CYAPI_FOUND)
+        set(WIN_RUNTIME_ITEMS ${WIN_RUNTIME_ITEMS}
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/Cypress/license.txt"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/cyusb3.inf"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/cyusb3.sys"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/cyusb3.cat"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/WdfCoInstaller01009.dll"
+        )
 
-endif(WIN32)
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/Cypress/license.txt"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CYPRESS_LICENSE}"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/Cypress/license.txt"
+            COMMENT "Copying Cypress License to output directory..."
+        )
+
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/cyusb3.inf"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CMAKE_CURRENT_SOURCE_DIR}/drivers/windows/cyusb3/cyusb3.inf"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/"
+            COMMENT "Copying cyusb3.inf to output directory..."
+        )
+
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/cyusb3.sys"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CYUSB3_DRIVER_DIR}/cyusb3.sys"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/"
+            COMMENT "Copying cyusb3.sys to output directory..."
+        )
+
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/cyusb3.cat"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CYUSB3_DRIVER_DIR}/cyusb3.cat"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/"
+            COMMENT "Copying cyusb3.cat to output directory..."
+        )
+
+        add_custom_command(
+            OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/WdfCoInstaller01009.dll"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CYUSB3_DRIVER_DIR}/WdfCoInstaller01009.dll"
+                "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/drivers/CyUSB3/"
+            COMMENT "Copying WdfCoInstaller01009.dll to output directory..."
+        )
+    endif()
+
+    set(WIN_RUNTIME_ITEMS ${WIN_RUNTIME_ITEMS}
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/COPYING"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.MIT.nuand"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.MIT.msc_stdbool"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.nuand"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.LGPLv2.1"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.GPLv2"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.vlfeat"
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.msc_inttypes"
+    )
+
+    add_custom_command(
+        OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/COPYING"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../COPYING"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/COPYING"
+        COMMENT "Copying bladeRF COPYING file to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.MIT.nuand"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.MIT.nuand"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.MIT.nuand"
+        COMMENT "Copying bladeRF LICENSE.MIT.nuand files to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.MIT.msc_stdbool"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.MIT.msc_stdbool"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.MIT.msc_stdbool"
+        COMMENT "Copying bladeRF LICENSE.MIT.msc_stdbool file to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.nuand"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.BSD.nuand"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.nuand"
+        COMMENT "Copying bladeRF LICENSE.BSD.nuand file to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.LGPLv2.1"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.LGPLv2.1"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.LGPLv2.1"
+        COMMENT "Copying bladeRF LICENSE.LGPLv2.1 file to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.GPLv2"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.GPLv2"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.GPLv2"
+        COMMENT "Copying bladeRF LICENSE.GPLv2 file to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.vlfeat"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.BSD.vlfeat"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.vlfeat"
+        COMMENT "Copying bladeRF LICENSE.BSD.vlfeat file to output directory..."
+    )
+
+    add_custom_command(
+        OUTPUT
+        "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.msc_inttypes"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_CURRENT_SOURCE_DIR}/../legal/licenses/LICENSE.BSD.msc_inttypes"
+            "${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/${CMAKE_CFG_INTDIR}/licenses/bladeRF/LICENSE.BSD.msc_inttypes"
+        COMMENT "Copying bladeRF LICENSE.BSD.msc_inttypes file to output directory..."
+    )
+
+    add_custom_target(win_runtime ALL DEPENDS ${WIN_RUNTIME_ITEMS})
+
+endif(WIN32 AND NOT CMAKE_CROSSCOMPILING)

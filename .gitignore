@@ -24,6 +24,8 @@ tags
 TAGS
 
 hdl/quartus/work/*
+hdl/quartus/hostedx*
+hdl/quartus/atsc_txx*
 
 fx3_firmware/make/toolchain.mk
 fx3_firmware/build/*
@@ -35,6 +37,9 @@ host/libraries/libbladeRF/doc/doxygen/html
 host/libraries/libbladeRF/doc/doxygen/Doxyfile
 host/libraries/libbladeRF/lib
 host/libraries/libbladeRF/bin
+
+host/misc/windows/scripts/bladeRF-env.bat
+host/misc/windows/scripts/work
 
 hdl/fpga/ip/altera/nios_system/.qsys_edit
 hdl/fpga/ip/altera/nios_system/nios_system.html

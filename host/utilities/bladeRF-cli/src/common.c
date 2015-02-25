@@ -30,7 +30,7 @@
 #include "cmd.h"
 #include "cmd/rxtx.h"
 #include "script.h"
-#include "interactive.h"
+#include "input.h"
 
 /* There's currently only ever 1 active cli_state */
 static struct cli_state *cli_state;
@@ -47,9 +47,9 @@ static inline void ctrlc_handler_common(int signal)
         }
 
         if (!waiting) {
-            /* Let out interactive support know we got a ctrl-C if we weren't just
+            /* Let interactive support know we got a ctrl-C if we weren't just
              * waiting on an rx/tx wait command */
-            interactive_ctrlc();
+            input_ctrlc();
         }
     }
 }
@@ -100,6 +100,8 @@ struct cli_state *cli_state_create()
         cli_state->last_lib_error = 0;
         cli_state->scripts = NULL;
 
+        pthread_mutex_init(&cli_state->dev_lock, NULL);
+
         cli_state->rx = rxtx_data_alloc(BLADERF_MODULE_RX);
         if (!cli_state->rx) {
             goto cli_state_create_fail;
@@ -107,18 +109,6 @@ struct cli_state *cli_state_create()
 
         cli_state->tx = rxtx_data_alloc(BLADERF_MODULE_TX);
         if (!cli_state->tx) {
-            goto cli_state_create_fail;
-        }
-
-        if (rxtx_startup(cli_state, BLADERF_MODULE_RX)) {
-            rxtx_data_free(cli_state->rx);
-            cli_state->rx = NULL;
-            goto cli_state_create_fail;
-        }
-
-        if (rxtx_startup(cli_state, BLADERF_MODULE_TX)) {
-            rxtx_data_free(cli_state->tx);
-            cli_state->tx = NULL;
             goto cli_state_create_fail;
         }
     }
@@ -130,6 +120,25 @@ struct cli_state *cli_state_create()
 cli_state_create_fail:
     cli_state_destroy(cli_state);
     return NULL;
+}
+
+int cli_start_tasks(struct cli_state *s)
+{
+    int status;
+
+    status = rxtx_startup(cli_state, BLADERF_MODULE_RX);
+    if (status != 0) {
+        cli_err(s, "Error", "Failed to start RX task.\n");
+        return CLI_RET_UNKNOWN;
+    }
+
+    status = rxtx_startup(cli_state, BLADERF_MODULE_TX);
+    if (status != 0) {
+        cli_err(s, "Error", "Failed to start TX task.\n");
+        return CLI_RET_UNKNOWN;
+    }
+
+    return 0;
 }
 
 void cli_state_destroy(struct cli_state *s)
@@ -162,7 +171,7 @@ bool cli_device_is_opened(struct cli_state *s)
     return s->dev != NULL;
 }
 
-bool cli_device_in_use(struct cli_state *s)
+bool cli_device_is_streaming(struct cli_state *s)
 {
     return cli_device_is_opened(s) &&
             (rxtx_task_running(s->rx) || rxtx_task_running(s->tx));
@@ -178,7 +187,7 @@ void cli_err(struct cli_state *s, const char *pfx, const char *format, ...)
     memset(lbuf, 0, sizeof(lbuf));
 
     /* If we're in a script, we can provide line number info */
-    if (cli_script_loaded(s->scripts)) {
+    if (!s->exec_from_cmdline && cli_script_loaded(s->scripts)) {
         ret = snprintf(lbuf, sizeof(lbuf), " (%s:%d)",
                        cli_script_file_name(s->scripts),
                        cli_script_line(s->scripts));
@@ -190,15 +199,15 @@ void cli_err(struct cli_state *s, const char *pfx, const char *format, ...)
         }
     }
 
-    /* +6 --> 3 newlines, 2 chars padding, NUL terminator */
-    err = calloc(strlen(lbuf) + strlen(pfx) + strlen(format) + 6, 1);
+    /* +7 --> 2 newlines, 4 chars padding, NUL terminator */
+    err = calloc(strlen(lbuf) + strlen(pfx) + strlen(format) + 7, 1);
     if (err) {
-        strcat(err, "\n");
+        strcat(err, "\n  ");
         strcat(err, pfx);
         strcat(err, lbuf);
         strcat(err, ": ");
         strcat(err, format);
-        strcat(err, "\n\n");
+        strcat(err, "\n");
 
         va_start(arg_list, format);
         vfprintf(stderr, err, arg_list);
@@ -209,6 +218,50 @@ void cli_err(struct cli_state *s, const char *pfx, const char *format, ...)
         fprintf(stderr, "\nYikes! Multiple errors occurred!\n");
     }
 }
+
+const char * cli_strerror(int error, int lib_error)
+{
+    switch (error) {
+        case CLI_RET_MEM:
+            return "A fatal memory allocation error has occurred";
+
+        case CLI_RET_UNKNOWN:
+            return "A fatal unknown error has occurred";
+
+        case CLI_RET_MAX_ARGC:
+            return "Number of arguments exceeds allowed maximum";
+
+        case CLI_RET_LIBBLADERF:
+            return bladerf_strerror(lib_error);
+
+        case CLI_RET_NODEV:
+            return "No devices are currently opened";
+
+        case CLI_RET_NARGS:
+            return "Invalid number of arguments provided";
+
+        case CLI_RET_NOFPGA:
+            return "Command requires FPGA to be loaded";
+
+        case CLI_RET_STATE:
+            return "Operation invalid in current state";
+
+        case CLI_RET_FILEOP:
+            return "File operation failed";
+
+        case CLI_RET_BUSY:
+            return "Could not complete operation - device is currently busy";
+
+        case CLI_RET_NOFILE:
+            return "File not found";
+
+        /* Other commands shall print out helpful info from within their
+         * implementation */
+        default:
+            return NULL;
+    }
+}
+
 
 void cli_error_init(struct cli_error *e)
 {
@@ -231,4 +284,30 @@ void get_last_error(struct cli_error *e, enum error_type *type, int *error)
     *type = e->type;
     *error = e->value;
     pthread_mutex_unlock(&e->lock);
+}
+
+int expand_and_open(const char *filename, const char *mode, FILE **file)
+{
+    int status;
+    char *expanded_filename;
+
+    *file = NULL;
+    expanded_filename = input_expand_path(filename);
+    if (expanded_filename == NULL) {
+        return CLI_RET_UNKNOWN; /* Shouldn't really ever happen */
+    }
+
+    *file = fopen(expanded_filename, mode);
+    if (*file == NULL) {
+        if (errno == ENOENT) {
+            status = CLI_RET_NOFILE;
+        } else {
+            status = CLI_RET_FILEOP;
+        }
+    } else {
+        status = 0;
+    }
+
+    free(expanded_filename);
+    return status;
 }

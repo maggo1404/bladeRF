@@ -24,255 +24,373 @@
 #include <stddef.h>
 
 #include "bladerf_priv.h"
-#include "bladeRF.h"
+#include "backend/backend.h"
+#include "lms.h"
+#include "tuning.h"
+#include "si5338.h"
 #include "log.h"
+#include "dc_cal_table.h"
+#include "xb.h"
+#include "version_compat.h"
 
-#define OTP_BUFFER_SIZE 256
-
-void bladerf_set_error(struct bladerf_error *error,
-                        bladerf_error_type type, int val)
+static inline int apply_lms_dc_cals(struct bladerf *dev)
 {
-    error->type = type;
-    error->value = val;
-}
+    int status = 0;
+    struct bladerf_lms_dc_cals cals;
+    const bool have_rx = BLADERF_HAS_RX_DC_CAL(dev);
+    const bool have_tx = BLADERF_HAS_TX_DC_CAL(dev);
 
-void bladerf_get_error(struct bladerf_error *error,
-                        bladerf_error_type *type, int *val)
-{
-    if (type) {
-        *type = error->type;
+    cals.lpf_tuning = -1;
+    cals.tx_lpf_i   = -1;
+    cals.tx_lpf_q   = -1;
+    cals.rx_lpf_i   = -1;
+    cals.rx_lpf_q   = -1;
+    cals.dc_ref     = -1;
+    cals.rxvga2a_i  = -1;
+    cals.rxvga2a_q  = -1;
+    cals.rxvga2b_i  = -1;
+    cals.rxvga2b_q  = -1;
+
+    if (have_rx) {
+        const struct bladerf_lms_dc_cals *reg_vals = &dev->cal.dc_rx->reg_vals;
+
+        cals.lpf_tuning = reg_vals->lpf_tuning;
+        cals.rx_lpf_i   = reg_vals->rx_lpf_i;
+        cals.rx_lpf_q   = reg_vals->rx_lpf_q;
+        cals.dc_ref     = reg_vals->dc_ref;
+        cals.rxvga2a_i  = reg_vals->rxvga2a_i;
+        cals.rxvga2a_q  = reg_vals->rxvga2a_q;
+        cals.rxvga2b_i  = reg_vals->rxvga2b_i;
+        cals.rxvga2b_q  = reg_vals->rxvga2b_q;
+
+        log_verbose("Fetched register values from RX DC cal table.\n");
     }
 
-    if (val) {
-        *val = error->value;
+    if (have_tx) {
+        const struct bladerf_lms_dc_cals *reg_vals = &dev->cal.dc_tx->reg_vals;
+
+        cals.tx_lpf_i = reg_vals->tx_lpf_i;
+        cals.tx_lpf_q = reg_vals->tx_lpf_q;
+
+        if (have_rx) {
+            if (cals.lpf_tuning != reg_vals->lpf_tuning) {
+                log_warning("LPF tuning mismatch in tables. "
+                            "RX=0x%04x, TX=0x%04x",
+                            cals.lpf_tuning, reg_vals->lpf_tuning);
+            }
+        } else {
+            /* Have TX cal but no RX cal -- use the RX values that came along
+             * for the ride when the TX table was generated */
+            cals.rx_lpf_i   = reg_vals->rx_lpf_i;
+            cals.rx_lpf_q   = reg_vals->rx_lpf_q;
+            cals.dc_ref     = reg_vals->dc_ref;
+            cals.rxvga2a_i  = reg_vals->rxvga2a_i;
+            cals.rxvga2a_q  = reg_vals->rxvga2a_q;
+            cals.rxvga2b_i  = reg_vals->rxvga2b_i;
+            cals.rxvga2b_q  = reg_vals->rxvga2b_q;
+        }
+
+        log_verbose("Fetched register values from TX DC cal table.\n");
     }
+
+    /* No TX table was loaded, so load LMS TX register cals from the RX table,
+     * if available */
+    if (have_rx && !have_tx) {
+        const struct bladerf_lms_dc_cals *reg_vals = &dev->cal.dc_rx->reg_vals;
+
+        cals.tx_lpf_i   = reg_vals->tx_lpf_i;
+        cals.tx_lpf_q   = reg_vals->tx_lpf_q;
+    }
+
+    if (have_rx || have_tx) {
+        status = lms_set_dc_cals(dev, &cals);
+
+        /* Force a re-tune so that we can apply the appropriate I/Q DC offset
+         * values from our calibration table */
+        if (status == 0) {
+            int rx_status = 0;
+            int tx_status = 0;
+
+            if (have_rx) {
+                unsigned int rx_f;
+                rx_status = tuning_get_freq(dev, BLADERF_MODULE_RX, &rx_f);
+                if (rx_status == 0) {
+                    rx_status = tuning_set_freq(dev, BLADERF_MODULE_RX, rx_f);
+                }
+            }
+
+            if (have_tx) {
+                unsigned int rx_f;
+                rx_status = tuning_get_freq(dev, BLADERF_MODULE_RX, &rx_f);
+                if (rx_status == 0) {
+                    rx_status = tuning_set_freq(dev, BLADERF_MODULE_RX, rx_f);
+                }
+            }
+
+            /* Report the first of any failures */
+            status = (rx_status == 0) ? tx_status : rx_status;
+        }
+    }
+
+    return status;
 }
 
-/* TODO Check for truncation (e.g., odd # bytes)? */
-size_t bytes_to_c16_samples(size_t n_bytes)
+int init_device(struct bladerf *dev)
 {
-    return n_bytes / (2 * sizeof(int16_t));
-}
-
-/* TODO Overflow check? */
-size_t c16_samples_to_bytes(size_t n_samples)
-{
-    return n_samples * 2 * sizeof(int16_t);
-}
-
-int bladerf_init_device(struct bladerf *dev)
-{
-    unsigned int actual;
+    int status;
     uint32_t val;
 
     /* Readback the GPIO values to see if they are default or already set */
-    bladerf_config_gpio_read( dev, &val );
+    status = CONFIG_GPIO_READ( dev, &val );
+    if (status != 0) {
+        log_debug("Failed to read GPIO config %s\n", bladerf_strerror(status));
+        return status;
+    }
 
-    if (val == 0) {
+    if ((val & 0x7f) == 0) {
         log_verbose( "Default GPIO value found - initializing device\n" );
 
         /* Set the GPIO pins to enable the LMS and select the low band */
-        bladerf_config_gpio_write( dev, 0x57 );
+        status = CONFIG_GPIO_WRITE(dev, 0x57);
+        if (status != 0) {
+            return status;
+        }
+
+        /* Disable the front ends */
+        status = lms_enable_rffe(dev, BLADERF_MODULE_TX, false);
+        if (status != 0) {
+            return status;
+        }
+
+        status = lms_enable_rffe(dev, BLADERF_MODULE_RX, false);
+        if (status != 0) {
+            return status;
+        }
 
         /* Set the internal LMS register to enable RX and TX */
-        bladerf_lms_write( dev, 0x05, 0x3e );
+        status = LMS_WRITE(dev, 0x05, 0x3e);
+        if (status != 0) {
+            return status;
+        }
 
         /* LMS FAQ: Improve TX spurious emission performance */
-        bladerf_lms_write( dev, 0x47, 0x40 );
+        status = LMS_WRITE(dev, 0x47, 0x40);
+        if (status != 0) {
+            return status;
+        }
 
         /* LMS FAQ: Improve ADC performance */
-        bladerf_lms_write( dev, 0x59, 0x29 );
+        status = LMS_WRITE(dev, 0x59, 0x29);
+        if (status != 0) {
+            return status;
+        }
 
         /* LMS FAQ: Common mode voltage for ADC */
-        bladerf_lms_write( dev, 0x64, 0x36 );
+        status = LMS_WRITE(dev, 0x64, 0x36);
+        if (status != 0) {
+            return status;
+        }
 
         /* LMS FAQ: Higher LNA Gain */
-        bladerf_lms_write( dev, 0x79, 0x37 );
+        status = LMS_WRITE(dev, 0x79, 0x37);
+        if (status != 0) {
+            return status;
+        }
 
-        /* FPGA workaround: Set IQ polarity for RX */
-        bladerf_lms_write( dev, 0x5a, 0xa0 );
+        /* Power down DC calibration comparators until they are need, as they
+         * have been shown to introduce undesirable artifacts into our signals.
+         * (This is documented in the LMS6 FAQ). */
 
-        /* Set a default saplerate */
-        bladerf_set_sample_rate( dev, BLADERF_MODULE_TX, 1000000, &actual );
-        bladerf_set_sample_rate( dev, BLADERF_MODULE_RX, 1000000, &actual );
+        status = lms_set(dev, 0x3f, 0x80);  /* TX LPF DC cal comparator */
+        if (status != 0) {
+            return status;
+        }
 
-        /* Enable TX and RX */
-        bladerf_enable_module( dev, BLADERF_MODULE_TX, false );
-        bladerf_enable_module( dev, BLADERF_MODULE_RX, false );
+        status = lms_set(dev, 0x5f, 0x80);  /* RX LPF DC cal comparator */
+        if (status != 0) {
+            return status;
+        }
+
+        status = lms_set(dev, 0x6e, 0xc0);  /* RXVGA2A/B DC cal comparators */
+        if (status != 0) {
+            return status;
+        }
+
+        /* Set a default samplerate */
+        status = si5338_set_sample_rate(dev, BLADERF_MODULE_TX, 1000000, NULL);
+        if (status != 0) {
+            return status;
+        }
+
+        status = si5338_set_sample_rate(dev, BLADERF_MODULE_RX, 1000000, NULL);
+        if (status != 0) {
+            return status;
+        }
 
         /* Set a default frequency of 1GHz */
-        bladerf_set_frequency( dev, BLADERF_MODULE_TX, 1000000000 );
-        bladerf_set_frequency( dev, BLADERF_MODULE_RX, 1000000000 );
+        status = tuning_set_freq(dev, BLADERF_MODULE_TX, 1000000000);
+        if (status != 0) {
+            return status;
+        }
+
+        status = tuning_set_freq(dev, BLADERF_MODULE_RX, 1000000000);
+        if (status != 0) {
+            return status;
+        }
 
         /* Set the calibrated VCTCXO DAC value */
-        bladerf_dac_write( dev, dev->dac_trim );
-    }
-
-    /* TODO: Read this return from the SPI calls */
-    return 0;
-}
-
-/******
- * CRC16 implementation from http://softwaremonkey.org/Code/CRC16
- */
-typedef  unsigned char                   byte;    /*     8 bit unsigned       */
-typedef  unsigned short int              word;    /*    16 bit unsigned       */
-
-static word crc16mp(word crcval, void *data_p, word count) {
-    /* CRC-16 Routine for processing multiple part data blocks.
-     * Pass 0 into 'crcval' for first call for any given block; for
-     * subsequent calls pass the CRC returned by the previous call. */
-    word            xx;
-    byte            *ptr=data_p;
-
-    while (count-- > 0) {
-        crcval=(word)(crcval^(word)(((word)*ptr++)<<8));
-        for (xx=0;xx<8;xx++) {
-            if(crcval&0x8000) { crcval=(word)((word)(crcval<<1)^0x1021); }
-            else              { crcval=(word)(crcval<<1);                }
+        status = DAC_WRITE(dev, dev->dac_trim);
+        if (status != 0) {
+            return status;
         }
+
     }
-    return(crcval);
+
+    /* Set up LMS DC offset register calibration and initial IQ settings,
+     * if any tables have been loaded already.
+     *
+     * This is done every time the device is opened (with an FPGA loaded),
+     * as the user may change/update DC calibration tables without reloading the
+     * FPGA.
+     */
+    status = apply_lms_dc_cals(dev);
+
+    return status;
 }
 
-static int extract_field(char *ptr, int len, char *field,
-                            char *val, size_t  maxlen) {
-    int c;
-    unsigned char *ub, *end;
-    unsigned short a1, a2;
-    size_t flen, wlen;
+int populate_abs_timeout(struct timespec *t, unsigned int timeout_ms)
+{
+    static const int nsec_per_sec = 1000 * 1000 * 1000;
+    const unsigned int timeout_sec = timeout_ms / 1000;
+    int status;
 
-    flen = strlen(field);
+    status = clock_gettime(CLOCK_REALTIME, t);
+    if (status != 0) {
+        return BLADERF_ERR_UNEXPECTED;
+    } else {
+        t->tv_sec += timeout_sec;
+        t->tv_nsec += (timeout_ms % 1000) * 1000 * 1000;
 
-    ub = (unsigned char *)ptr;
-    end = ub + len;
-    while (ub < end) {
-        c = *ub;
+        if (t->tv_nsec >= nsec_per_sec) {
+            t->tv_sec += t->tv_nsec / nsec_per_sec;
+            t->tv_nsec %= nsec_per_sec;
+        }
 
-        if (c == 0xff) // flash and OTP are 0xff if they've never been written to
+        return 0;
+    }
+}
+
+int config_gpio_write(struct bladerf *dev, uint32_t val)
+{
+    /* If we're connected at HS, we need to use smaller DMA transfers */
+    if (dev->usb_speed == BLADERF_DEVICE_SPEED_HIGH   ) {
+        val |= BLADERF_GPIO_FEATURE_SMALL_DMA_XFER;
+    } else if (dev->usb_speed == BLADERF_DEVICE_SPEED_SUPER) {
+        val &= ~BLADERF_GPIO_FEATURE_SMALL_DMA_XFER;
+    } else {
+        assert(!"Encountered unknown USB speed");
+        return BLADERF_ERR_UNEXPECTED;
+    }
+
+   return dev->fn->config_gpio_write(dev, val);
+}
+
+static inline int requires_timestamps(bladerf_format format, bool *required)
+{
+    int status = 0;
+
+    switch (format) {
+        case BLADERF_FORMAT_SC16_Q11_META:
+            *required = true;
             break;
 
-        a1 = LE16_TO_HOST(*(unsigned short *)(&ub[c+1]));  // read checksum
-        a2 = crc16mp(0, ub, c+1);  // calculated checksum
+        case BLADERF_FORMAT_SC16_Q11:
+            *required = false;
+            break;
 
-        if (a1 == a2) {
-            if (!strncmp((char *)ub + 1, field, flen)) {
-                wlen = min_sz(c - flen, maxlen);
-                strncpy(val, (char *)ub + 1 + flen, wlen);
-                val[wlen] = 0;
-                return 0;
-            }
-        } else {
-            log_warning( "%s: Field checksum mismatch\n", __FUNCTION__);
+        default:
             return BLADERF_ERR_INVAL;
-        }
-        ub += c + 3; //skip past `c' bytes, 2 byte CRC field, and 1 byte len field
     }
-    return BLADERF_ERR_INVAL;
+
+    return status;
 }
 
-int encode_field(char *ptr, int len, int *idx, char *field,
-                            char *val) {
-    int vlen, flen, tlen;
-    flen = (int)strlen(field);
-    vlen = (int)strlen(val);
-    tlen = flen + vlen + 1;
+int perform_format_config(struct bladerf *dev, bladerf_module module,
+                          bladerf_format format)
+{
+    int status = 0;
+    bool use_timestamps;
+    bladerf_module other;
+    bool other_using_timestamps;
+    uint32_t gpio_val;
 
-    if (tlen >= 256 || *idx + tlen >= len)
-        return BLADERF_ERR_MEM;
+    status = requires_timestamps(format, &use_timestamps);
+    if (status != 0) {
+        log_debug("%s: Invalid format: %d\n", __FUNCTION__, format);
+        return status;
+    }
 
-    ptr[*idx] = flen + vlen;
-    strcpy(&ptr[*idx + 1], field);
-    strcpy(&ptr[*idx + 1 + flen], val);
-    *(unsigned short *)(&ptr[*idx + tlen ]) = crc16mp(0, &ptr[*idx ], tlen);
-    *idx += tlen + 2;
+    if (use_timestamps && version_less_than(&dev->fpga_version, 0, 1, 0)) {
+        log_warning("Timestamp support requires FPGA v0.1.0 or later.\n");
+        return BLADERF_ERR_UPDATE_FPGA;
+    }
+
+    switch (module) {
+        case BLADERF_MODULE_RX:
+            other = BLADERF_MODULE_TX;
+            break;
+
+        case BLADERF_MODULE_TX:
+            other = BLADERF_MODULE_RX;
+            break;
+
+        default:
+            log_debug("Invalid module: %d\n", module);
+            return BLADERF_ERR_INVAL;
+    }
+
+    status = requires_timestamps(dev->module_format[other],
+                                 &other_using_timestamps);
+
+    if ((status == 0) && (other_using_timestamps != use_timestamps)) {
+        log_debug("Format conflict detected: RX=%d, TX=%d\n");
+        return BLADERF_ERR_INVAL;
+    }
+
+    status = CONFIG_GPIO_READ(dev, &gpio_val);
+    if (status != 0) {
+        return status;
+    }
+
+    if (use_timestamps) {
+        gpio_val |= (BLADERF_GPIO_TIMESTAMP | BLADERF_GPIO_TIMESTAMP_DIV2);
+    } else {
+        gpio_val &= ~(BLADERF_GPIO_TIMESTAMP | BLADERF_GPIO_TIMESTAMP_DIV2);
+    }
+
+    status = CONFIG_GPIO_WRITE(dev, gpio_val);
+
+    if (status == 0) {
+        dev->module_format[module] = format;
+    }
+
+    return status;
+}
+
+int perform_format_deconfig(struct bladerf *dev, bladerf_module module)
+{
+    switch (module) {
+        case BLADERF_MODULE_RX:
+        case BLADERF_MODULE_TX:
+            /* We'll reconfigure the HW when we call perform_format_config, so
+             * we just need to update our stored information */
+            dev->module_format[module] = -1;
+            break;
+
+        default:
+            log_debug("%s: Invalid module: %d\n", __FUNCTION__, module);
+            return BLADERF_ERR_INVAL;
+    }
+
     return 0;
-}
-
-int bladerf_get_otp_field(struct bladerf *dev, char *field,
-                             char *data, size_t data_size)
-{
-    int status;
-    char otp[OTP_BUFFER_SIZE];
-
-    memset(otp, 0xff, OTP_BUFFER_SIZE);
-
-    status = dev->fn->get_otp(dev, otp);
-    if (status < 0)
-        return status;
-    else
-        return extract_field(otp, OTP_BUFFER_SIZE, field, data, data_size);
-}
-
-int bladerf_get_cal_field(struct bladerf *dev, char *field,
-                            char *data, size_t data_size)
-{
-    int status;
-    char cal[CAL_BUFFER_SIZE];
-
-    status = dev->fn->get_cal(dev, cal);
-    if (status < 0)
-        return status;
-    else
-        return extract_field(cal, CAL_BUFFER_SIZE, field, data, data_size);
-}
-
-int bladerf_read_serial(struct bladerf *dev, char *serial_buf)
-{
-    int status;
-
-    status = bladerf_get_otp_field(dev, "S", serial_buf,
-                                    BLADERF_SERIAL_LENGTH - 1);
-
-    if (status < 0) {
-        log_error("Unable to fetch serial number. Defaulting to 0's.\n");
-        memset(dev->ident.serial, '0', BLADERF_SERIAL_LENGTH - 1);
-
-        /* Treat this as non-fatal */
-        status = 0;
-    }
-
-    serial_buf[BLADERF_SERIAL_LENGTH - 1] = '\0';
-
-    return status;
-}
-
-int bladerf_get_and_cache_vctcxo_trim(struct bladerf *dev)
-{
-    int status;
-    bool ok;
-    int16_t trim;
-    char tmp[7] = { 0 };
-
-    status = bladerf_get_cal_field(dev, "DAC", tmp, sizeof(tmp) - 1);
-    if (!status) {
-        trim = str2uint(tmp, 0, 0xffff, &ok);
-    }
-
-    if (!status && ok) {
-        dev->dac_trim = trim;
-    } else {
-        log_debug("Unable to fetch DAC trim. Defaulting to 0x8000\n");
-        dev->dac_trim = 0x8000;
-    }
-
-    return status;
-}
-
-int bladerf_get_and_cache_fpga_size(struct bladerf *device)
-{
-    int status;
-    char tmp[7] = { 0 };
-
-    status = bladerf_get_cal_field(device, "B", tmp, sizeof(tmp) - 1);
-
-    if (!strcmp("40", tmp)) {
-        device->fpga_size = BLADERF_FPGA_40KLE;
-    } else if(!strcmp("115", tmp)) {
-        device->fpga_size = BLADERF_FPGA_115KLE;
-    } else {
-        device->fpga_size = BLADERF_FPGA_UNKNOWN;
-    }
-
-    return status;
 }

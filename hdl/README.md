@@ -18,34 +18,37 @@ Some FPGA binaries are available for [download][download].  Please note the md5 
 [download]: http://nuand.com/fpga (nuand/FPGA Images)
 
 ## Required Software ##
-We use an [Altera][altera] [Cyclone IV E FPGA][cive].  The size of the FPGA is the only difference between the x40 and x115 models.  Altera provides their [Quartus II software][quartus] for synthesizing designs for their FPGAs.  It is free of charge, but not open source and may require registering on their site to download the software.
+We use an [Altera][altera] [Cyclone IV E FPGA][cive].  The size of the FPGA is the only difference between the x40 and x115 models.  Altera provides their [Quartus II][quartus] software for synthesizing designs for their FPGAs.  It is free of charge, but not open source and may require registering on their site to download the software.
+
+**Important Note:** Be sure to download [Quartus II version 13.1][quartus] with [update 4], which the bladeRF project files are based upon. Quartus II version 14.0 is **not** currently reverse-compatible with [Quartus II version 13.1][quartus].
 
 [altera]: http://www.altera.com (Altera)
-[quartus]: http://www.altera.com/products/software/quartus-ii/web-edition/qts-we-index.html (Quartus II Web Edition Software)
+[quartus]: http://dl.altera.com/13.1/?edition=web (Quartus II Web Edition 13.1 Software)
 [cive]: http://www.altera.com/devices/fpga/cyclone-iv/overview/cyiv-overview.html
+[update 4]: http://www.altera.com/literature/rn/archives/rn_qts_131up4_dev_support.pdf (Quartus II 13.1 Update 4)
 
 ## HDL Structure ##
 Since the FPGA is connected and soldered down to the board, it makes sense to have a single top level which defines where the pins go, their IO levels and their genera directionality.  We use a single `bladerf.vhd` top level to define a VHDL entity called `bladerf` that defines these pins.
 
 We realize people will want to change the internal guts of the FPGA for their own programmable logic reasons.  Because of this, we decided to differentiate the implementations using a feature of the Quartus II project file called Revisions.  Revisions can take a base design (top level entity, a part and pins) and duplicate that project, recording any source level changes you wish to make to the project.  This way, a user must only create their own architecture that is the new implementation of the `bladerf` top level.
 
-This technique can be seen with the different architectures:
+This technique can be seen with the currently supported architectures:
 
-| Architecture  | Description                                                                           |
-| :------------ | :------------------------------------------------------------------------------------ |
-| fsk_bridge    | Implements a serial device which is connected via FSK to another bladeRF              |
-| headless      | Does not require a USB connection to a host and is fully autonomous                   |
-| hosted        | Listens for commands from the USB connection to perform operations or send/receive RF |
-| qpsk_tx       | A debug implementation which just transmits 3.84Msps QPSK which has been RRC filtered |
+| Architecture  | Description                                                                                                       |
+| :------------ | :---------------------------------------------------------------------------------------------------------------- |
+| hosted        | Listens for commands from the USB connection to perform operations or send/receive RF.                            |
+| atsc_tx       | ATSC transmittter - Reads 4-bit ATSC symbols via USB and performs pilot insertion, filtering, and baseband shift. |
 
 ## Building the Project ##
-The Quartus II build tools supports TCL as a scripting language which we utilize to not only create the project file, but build the system without requiring the need of the GUI. Currently, the `build_bladerf.sh` performs some environment checks, builds the NIOS BSP and software, and then kicks off TCL scripts to build the FPGA image. 
+The Quartus II build tools supports TCL as a scripting language which we utilize to not only create the project file, but build the system without requiring the need of the GUI. Currently, the `build_bladerf.sh` performs some environment checks, builds the NIOS BSP and software, and then kicks off TCL scripts to build the FPGA image.
+
+To support multiple versions of Quartus II on the same machine and to ensure the environment is appropriately setup, please use the `nios2_command_shell.sh` script to get into an appropriate Quartus II environment.  Note that this shell script is usually located in the `nios2eds` directory of your Quartus II install directory.  Also note that this is the preferred method regardless of using Windows or Linux to build.  If you're using pybombs, make sure you haven't run `setup_env.sh`, as it prevents `nios2_command_shell.sh` from working properly.
 
 1. Take note of which Altera Cyclone IV you have. (The EP4CE40 is 40 kLE, and the EP4CE115 is 115 kLE.)  You'll need this size below...
 2. Enter the `quartus` directory
-3. Execute ./build_bladerf.sh -h to view the usage for the build script. Note the size and revision options. Also note any items you'll need to add to your PATH before continuing.
-4. Execute ./build_bladerf.sh -s &lt;size&gt; -r &lt;revision&gt;, with the relevant size for your bladeRF, and the desired revision.  This will create the NIOS system and software associated with the FPGA build needed by the internal RAM for execution.
-5. The current directory should now contain an FPGA image file, named in the form, &lt;revision&gt;x&lt;size&gt;.rbf
+3. Execute, from inside an appropriate NIOS II command shell, `./build_bladerf.sh -h` to view the usage for the build script. Note the size and revision options. Also note any items you'll need to add to your PATH before continuing.
+4. Execute, from inside an appropriate NIOS II command shell, `./build_bladerf.sh -s <size> -r <revision>`, with the relevant size for your bladeRF, and the desired revision.  This will create the NIOS system and software associated with the FPGA build needed by the internal RAM for execution.
+5. The output of the build will be stored in a directory named in the form, `<revision>x<size>-<build time>`.  This directory will contain the bitstream, summaries, and reports.
 
 Note that there will be a _lot_ of information displayed from notes to critical warnings.  Some of these are benign and others are, in fact, critical.
 

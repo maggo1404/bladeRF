@@ -136,20 +136,68 @@ int str2version(const char *str, struct bladerf_version *version);
 
 /**
  * Convert a bladerf_dev_speed to a string suitable for printing
+ *
+ * @note The caller should not attempt to modify or free() the returned string.
+ *
+ * @param   speed   Device speed
+ * @return  Const string describing the provided speed
  */
 const char * devspeed2str(bladerf_dev_speed speed);
+
+/**
+ * Convert a string to libbladeRF log verbosity level
+ *
+ * @param[in]   str     Input string
+ * @param[out]  ok      Value is updated to true if the input string was valid
+ *
+ * @return Log level if ok is true, undefined otherwise
+ */
+bladerf_log_level str2loglevel(const char *str, bool *ok);
+
+/**
+ * Convert a module enumeration to a string
+ *
+ * @note The caller should not attempt to modify or free() the returned string.
+ *
+ * @param   module      Module to convert to string
+ * @return  String representation of module
+ */
+const char * module2str(bladerf_module m);
+
+/**
+ * Convert a string to a loopback mode
+ *
+ * @param[in]   str         String to convert
+ * @param[out]  loopback    Corresponding loopback mode. Only valid when
+ *                          this function returns successfully
+ *
+ * @return 0 on success, -1 on invalid string
+ */
+int str2loopback(const char *str, bladerf_loopback *loopback);
 
 /**
  * Convert a string to an argc/argv-style argument list. Arguments are split
  * on whitespace. Double-quotes may be used to include whitespace in an
  * argument.  Backescapes are not supported.
  *
- * @param[in]   str     String to break into args
- * @param[out]  argv    Will be updated to point to heap-allocated argv list
+ * @param[in]   str         String to break into args
+ * @param[in]   eol_comm    End of line comment delimiter
+ * @param[out]  argv        Will be updated to point to heap-allocated argv list
  *
- * @return argc on success, -1 on failure
+ * @return argc on success, -1 on failure, -2 on unterminated quote
  */
-int str2args(const char *line, char ***argv);
+int str2args(const char *line, char eol_comm, char ***argv);
+
+/**
+ * Convert RX LNA gain strings to their associated enum values
+ *
+ * @param[in]   str         Gain string to convert
+ * @param[out]  gain        Associated LNA gain string. Set to
+ *                          BLADERF_LNA_GAIN_UNKNOWN on error.
+ *
+ * @return 0 on success, -1 on invalid string
+ */
+int str2lnagain(const char *str, bladerf_lna_gain *gain);
 
 /**
  * Free argument list previously allocated by str2args
@@ -158,5 +206,14 @@ int str2args(const char *line, char ***argv);
  * @param       argv    Argument list
  */
 void free_args(int argc, char **argv);
+
+/**
+ * Get a string description of the specified bladeRF backend
+ *
+ * @param  b       Backend to get a string for
+ *
+ * @return NUL-terminated string
+ */
+const char *backend_description(bladerf_backend b);
 
 #endif

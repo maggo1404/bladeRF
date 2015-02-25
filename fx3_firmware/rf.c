@@ -19,19 +19,29 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include <cyu3error.h>
+#include <cyu3gpio.h>
+#include <cyu3usb.h>
+#include <cyu3uart.h>
+#include "gpif.h"
 #include "rf.h"
-#include "cyu3error.h"
-#include "cyu3gpio.h"
-#include "cyu3usb.h"
-#include "cyu3gpif.h"
-#include "cyfxgpif_RFlink.h"
-#include "cyu3uart.h"
 
 static CyU3PDmaChannel glChHandlebladeRFUtoUART;   /* DMA Channel for U2P transfers */
 static CyU3PDmaChannel glChHandlebladeRFUARTtoU;   /* DMA Channel for U2P transfers */
 
 static CyU3PDmaChannel glChHandleUtoP;
 static CyU3PDmaChannel glChHandlePtoU;
+
+static int loopback = 0;
+static int loopback_when_created;
+
+void NuandRFLinkLoopBack(int lp) {
+    loopback = lp;
+}
+
+int NuandRFLinkGetLoopBack() {
+    return loopback;
+}
 
 static void UartBridgeStart(void)
 {
@@ -52,7 +62,7 @@ static void UartBridgeStart(void)
 
     /* Set UART configuration */
     CyU3PMemSet ((uint8_t *)&uartConfig, 0, sizeof (uartConfig));
-    uartConfig.baudRate = CY_U3P_UART_BAUDRATE_115200;
+    uartConfig.baudRate = CY_U3P_UART_BAUDRATE_4M; // CY_U3P_UART_BAUDRATE_115200;
     uartConfig.stopBit = CY_U3P_UART_ONE_STOP_BIT;
     uartConfig.parity = CY_U3P_UART_NO_PARITY;
     uartConfig.txEnable = CyTrue;
@@ -225,22 +235,15 @@ static void NuandRFLinkStart(void)
     NuandAllowSuspend(CyFalse);
     NuandGPIOReconfigure(CyTrue, CyTrue);
 
-    /* Load the GPIF configuration for loading the RF transceiver */
-    apiRetStatus = CyU3PGpifLoad(&Rflink_CyFxGpifConfig);
-    if (apiRetStatus != CY_U3P_SUCCESS)
-    {
-        CyU3PDebugPrint (4, "CyU3PGpifLoad failed, Error Code = %d\n",apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
-    }
-
-    // strobe the RESET pin to the FPGA
     CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
+    CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
+    CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
     CyU3PGpioSetValue(GPIO_SYS_RST, CyFalse);
 
-    /* Start the state machine. */
-    apiRetStatus = CyU3PGpifSMStart(RFLINK_START, RFLINK_ALPHA_START);
+    apiRetStatus = NuandConfigureGpif(GPIF_CONFIG_RF_LINK);
     if (apiRetStatus != CY_U3P_SUCCESS) {
-        CyU3PDebugPrint(4, "CyU3PGpifSMStart failed, Error Code = %d\n",apiRetStatus);
+        CyU3PDebugPrint(4, "Failed to configure GPIF, Error code = %d\n",
+                        apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
     }
 
@@ -315,6 +318,13 @@ static void NuandRFLinkStart(void)
     dmaCfg.consHeader = 0;
     dmaCfg.prodAvailCount = 0;
 
+    loopback_when_created = loopback;
+
+    if (loopback) {
+        dmaCfg.prodSckId = BLADE_RF_SAMPLE_EP_PRODUCER_USB_SOCKET;
+        dmaCfg.consSckId = BLADE_RF_SAMPLE_EP_CONSUMER_USB_SOCKET;
+    }
+
     apiRetStatus = CyU3PDmaChannelCreate(&glChHandleUtoP, CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
 
     if (apiRetStatus != CY_U3P_SUCCESS) {
@@ -322,12 +332,14 @@ static void NuandRFLinkStart(void)
         CyFxAppErrorHandler(apiRetStatus);
     }
 
-    dmaCfg.prodSckId = CY_U3P_PIB_SOCKET_0;
-    dmaCfg.consSckId = BLADE_RF_SAMPLE_EP_CONSUMER_USB_SOCKET;
-    apiRetStatus = CyU3PDmaChannelCreate(&glChHandlePtoU, CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        CyU3PDebugPrint(4, "CyU3PDmaMultiChannelCreate failed, Error code = %d\n", apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+    if (!loopback) {
+        dmaCfg.prodSckId = CY_U3P_PIB_SOCKET_0;
+        dmaCfg.consSckId = BLADE_RF_SAMPLE_EP_CONSUMER_USB_SOCKET;
+        apiRetStatus = CyU3PDmaChannelCreate(&glChHandlePtoU, CY_U3P_DMA_TYPE_AUTO, &dmaCfg);
+        if (apiRetStatus != CY_U3P_SUCCESS) {
+            CyU3PDebugPrint(4, "CyU3PDmaMultiChannelCreate failed, Error code = %d\n", apiRetStatus);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
     }
 
     /* Flush the Endpoint memory */
@@ -337,18 +349,18 @@ static void NuandRFLinkStart(void)
     /* Set DMA channel transfer size. */
 
     apiRetStatus = CyU3PDmaChannelSetXfer (&glChHandleUtoP, BLADE_DMA_TX_SIZE);
-
     if (apiRetStatus != CY_U3P_SUCCESS) {
         CyU3PDebugPrint(4, "CyU3PDmaChannelSetXfer Failed, Error code = %d\n", apiRetStatus);
         CyFxAppErrorHandler(apiRetStatus);
     }
 
-    apiRetStatus = CyU3PDmaChannelSetXfer (&glChHandlePtoU, BLADE_DMA_TX_SIZE);
-    if (apiRetStatus != CY_U3P_SUCCESS) {
-        CyU3PDebugPrint(4, "CyU3PDmaChannelSetXfer Failed, Error code = %d\n", apiRetStatus);
-        CyFxAppErrorHandler(apiRetStatus);
+    if (!loopback) {
+        apiRetStatus = CyU3PDmaChannelSetXfer (&glChHandlePtoU, BLADE_DMA_TX_SIZE);
+        if (apiRetStatus != CY_U3P_SUCCESS) {
+            CyU3PDebugPrint(4, "CyU3PDmaChannelSetXfer Failed, Error code = %d\n", apiRetStatus);
+            CyFxAppErrorHandler(apiRetStatus);
+        }
     }
-
 
     UartBridgeStart();
     glAppMode = MODE_RF_CONFIG;
@@ -363,13 +375,18 @@ static void NuandRFLinkStop (void)
     CyU3PEpConfig_t epCfg;
     CyU3PReturnStatus_t apiRetStatus = CY_U3P_SUCCESS;
 
+    CyU3PGpioSetValue(GPIO_SYS_RST, CyTrue);
+    CyU3PGpioSetValue(GPIO_RX_EN, CyFalse);
+    CyU3PGpioSetValue(GPIO_TX_EN, CyFalse);
+
     /* Flush endpoint memory buffers */
     CyU3PUsbFlushEp(BLADE_RF_SAMPLE_EP_PRODUCER);
     CyU3PUsbFlushEp(BLADE_RF_SAMPLE_EP_CONSUMER);
 
     /* Destroy the channels */
     CyU3PDmaChannelDestroy(&glChHandleUtoP);
-    CyU3PDmaChannelDestroy(&glChHandlePtoU);
+    if (!loopback_when_created)
+        CyU3PDmaChannelDestroy(&glChHandlePtoU);
 
     /* Disable endpoints. */
     CyU3PMemSet ((uint8_t *)&epCfg, 0, sizeof (epCfg));
@@ -390,7 +407,12 @@ static void NuandRFLinkStop (void)
     }
 
     /* Reset the GPIF */
-    CyU3PGpifDisable(CyTrue);
+    apiRetStatus = NuandConfigureGpif(GPIF_CONFIG_DISABLED);
+    if (apiRetStatus != CY_U3P_SUCCESS) {
+        CyU3PDebugPrint(4, "Failed to deinitialize GPIF. Error code = %d\n",
+                        apiRetStatus);
+        CyFxAppErrorHandler(apiRetStatus);
+    }
 
     UartBridgeStop();
     NuandAllowSuspend(CyTrue);
@@ -404,9 +426,39 @@ static uint8_t RF_status_bits[] = {
     [BLADE_UART_EP_CONSUMER] = 0,
 };
 
+CyU3PReturnStatus_t NuandRFLinkResetEndpoint(uint8_t endpoint)
+{
+    CyU3PReturnStatus_t status = CY_U3P_ERROR_BAD_ARGUMENT;
+
+    switch(endpoint) {
+        case BLADE_RF_SAMPLE_EP_PRODUCER:
+            status = ClearDMAChannel(endpoint, &glChHandleUtoP,
+                                     BLADE_DMA_TX_SIZE);
+            break;
+
+        case BLADE_RF_SAMPLE_EP_CONSUMER:
+            status = ClearDMAChannel(endpoint, &glChHandlePtoU,
+                                     BLADE_DMA_TX_SIZE);
+            break;
+
+        case BLADE_UART_EP_PRODUCER:
+            status = ClearDMAChannel(endpoint, &glChHandlebladeRFUtoUART,
+                                     BLADE_DMA_TX_SIZE);
+            break;
+
+        case BLADE_UART_EP_CONSUMER:
+            status = ClearDMAChannel(endpoint, &glChHandlebladeRFUARTtoU,
+                                     BLADE_DMA_TX_SIZE);
+            break;
+    }
+
+    return status;
+}
+
 CyBool_t NuandRFLinkHaltEndpoint(CyBool_t set, uint16_t endpoint)
 {
     CyBool_t isHandled = CyFalse;
+    CyU3PReturnStatus_t status = CY_U3P_ERROR_BAD_ARGUMENT;
 
     switch(endpoint) {
     case BLADE_RF_SAMPLE_EP_PRODUCER:
@@ -415,27 +467,18 @@ CyBool_t NuandRFLinkHaltEndpoint(CyBool_t set, uint16_t endpoint)
     case BLADE_UART_EP_CONSUMER:
         isHandled = !set;
         RF_status_bits[endpoint] = set;
+        status = NuandRFLinkResetEndpoint(endpoint);
         break;
     }
 
-    switch(endpoint) {
-    case BLADE_RF_SAMPLE_EP_PRODUCER:
-        ClearDMAChannel(endpoint, &glChHandleUtoP, BLADE_DMA_TX_SIZE, set);
-        break;
-    case BLADE_RF_SAMPLE_EP_CONSUMER:
-        ClearDMAChannel(endpoint, &glChHandlePtoU, BLADE_DMA_TX_SIZE, set);
-        break;
-    case BLADE_UART_EP_PRODUCER:
-        ClearDMAChannel(endpoint,
-                &glChHandlebladeRFUtoUART, BLADE_DMA_TX_SIZE, set);
-        break;
-    case BLADE_UART_EP_CONSUMER:
-        ClearDMAChannel(endpoint,
-                &glChHandlebladeRFUARTtoU, BLADE_DMA_TX_SIZE, set);
-        break;
+    if (status == CY_U3P_SUCCESS) {
+        CyU3PUsbStall (endpoint, CyFalse, CyTrue);
+        if(!set) {
+            CyU3PUsbAckSetup ();
+        }
     }
 
-    return isHandled;
+    return isHandled && status == CY_U3P_SUCCESS;
 }
 
 CyBool_t NuandRFLinkHalted(uint16_t endpoint, uint8_t * data)
@@ -460,4 +503,5 @@ const struct NuandApplication NuandRFLink = {
     .stop = NuandRFLinkStop,
     .halt_endpoint = NuandRFLinkHaltEndpoint,
     .halted = NuandRFLinkHalted,
+    .reset_endpoint = NuandRFLinkResetEndpoint,
 };

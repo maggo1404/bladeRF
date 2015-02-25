@@ -239,8 +239,6 @@ void free_args(int argc, char **argv)
         for (i = 0; i < argc; i++) {
             free(argv[i]);
         }
-
-        argc = 0;
         free(argv);
     }
 }
@@ -256,14 +254,15 @@ static void zero_argvs(int start, int end, char **argv)
 /* Returns 0 on success, -1 on failure */
 static int append_char(char **arg, int *arg_size, int *arg_i, char c)
 {
-    void *tmp;
+    char *tmp;
 
     if (*arg_i >= *arg_size) {
-        tmp = realloc(*arg, *arg_size * 2);
+        tmp = (char *)realloc(*arg, *arg_size * 2);
 
         if (!tmp) {
             return -1;
         } else {
+            memset(tmp + *arg_size, 0, *arg_size);
             *arg = tmp;
             *arg_size = *arg_size * 2;
         }
@@ -292,7 +291,71 @@ const char * devspeed2str(bladerf_dev_speed speed)
     }
 }
 
-int str2args(const char *line, char ***argv_ret)
+bladerf_log_level str2loglevel(const char *str, bool *ok)
+{
+    bladerf_log_level level = BLADERF_LOG_LEVEL_ERROR;
+    bool valid = true;
+
+    if (!strcasecmp(str, "critical")) {
+        level = BLADERF_LOG_LEVEL_CRITICAL;
+    } else if (!strcasecmp(str, "error")) {
+        level = BLADERF_LOG_LEVEL_ERROR;
+    } else if (!strcasecmp(str, "warning")) {
+        level = BLADERF_LOG_LEVEL_WARNING;
+    } else if (!strcasecmp(str, "info")) {
+        level = BLADERF_LOG_LEVEL_INFO;
+    } else if (!strcasecmp(str, "debug")) {
+        level = BLADERF_LOG_LEVEL_DEBUG;
+    } else if (!strcasecmp(str, "verbose")) {
+        level = BLADERF_LOG_LEVEL_VERBOSE;
+    } else {
+        valid = false;
+    }
+
+    *ok = valid;
+    return level;
+}
+
+const char * module2str(bladerf_module m)
+{
+    switch (m) {
+        case BLADERF_MODULE_RX:
+            return "RX";
+        case BLADERF_MODULE_TX:
+            return "TX";
+        default:
+            return "Unknown";
+    }
+}
+
+int str2loopback(const char *str, bladerf_loopback *loopback)
+{
+    int status = 0;
+
+    if (!strcasecmp("bb_txlpf_rxvga2", str)) {
+        *loopback = BLADERF_LB_BB_TXLPF_RXVGA2;
+    } else if (!strcasecmp("bb_txlpf_rxlpf", str)) {
+        *loopback = BLADERF_LB_BB_TXLPF_RXLPF;
+    } else if (!strcasecmp("bb_txvga1_rxvga2", str)) {
+        *loopback = BLADERF_LB_BB_TXVGA1_RXVGA2;
+    } else if (!strcasecmp("bb_txvga1_rxlpf", str)) {
+        *loopback = BLADERF_LB_BB_TXVGA1_RXLPF;
+    } else if (!strcasecmp("rf_lna1", str)) {
+        *loopback = BLADERF_LB_RF_LNA1;
+    } else if (!strcasecmp("rf_lna2", str)) {
+        *loopback = BLADERF_LB_RF_LNA2;
+    } else if (!strcasecmp("rf_lna3", str)) {
+        *loopback = BLADERF_LB_RF_LNA3;
+    } else if (!strcasecmp("none", str)) {
+        *loopback = BLADERF_LB_NONE;
+    } else {
+        status = -1;
+    }
+
+    return status;
+}
+
+int str2args(const char *line, char comment_char, char ***argv_ret)
 {
     int line_i, arg_i;      /* Index into line and current argument */
     int argv_size = 10;     /* Initial # of allocated args */
@@ -301,10 +364,11 @@ int str2args(const char *line, char ***argv_ret)
     int argc;
     enum str2args_parse_state state = PARSE_STATE_IN_SPACE;
     const size_t line_len = strlen(line);
+    bool got_eol_comment = false;
 
 
     argc = arg_i = 0;
-    argv = malloc(argv_size * sizeof(char *));
+    argv = (char **)malloc(argv_size * sizeof(char *));
     if (!argv) {
         return -1;
     }
@@ -313,12 +377,19 @@ int str2args(const char *line, char ***argv_ret)
     arg_size = 0;
     line_i = 0;
 
-    while ((size_t)line_i < line_len && state != PARSE_STATE_ERROR) {
+    while ( ((size_t)line_i < line_len) &&
+            state != PARSE_STATE_ERROR  &&
+            !got_eol_comment) {
+
         switch (state) {
             case PARSE_STATE_IN_SPACE:
                 /* Found the start of the next argument */
-                if (!isspace(line[line_i])) {
-                    state = PARSE_STATE_START_ARG;
+                if (!isspace((unsigned char) line[line_i])) {
+                    if (line[line_i] == comment_char) {
+                        got_eol_comment = true;
+                    } else {
+                        state = PARSE_STATE_START_ARG;
+                    }
                 } else {
                     /* Gobble up space */
                     line_i++;
@@ -349,7 +420,7 @@ int str2args(const char *line, char ***argv_ret)
 
                     /* Allocate this argument. This will be
                      * realloc'd as necessary by append_char() */
-                    argv[argc] = calloc(arg_size, 1);
+                    argv[argc] = (char *)calloc(arg_size, 1);
                     if (!argv[argc]) {
                         state = PARSE_STATE_ERROR;
                         break;
@@ -376,10 +447,12 @@ int str2args(const char *line, char ***argv_ret)
                 break;
 
             case PARSE_STATE_IN_ARG:
-                if (isspace(line[line_i])) {
+                if (isspace((unsigned char) line[line_i])) {
                     state = PARSE_STATE_IN_SPACE;
                 } else if (line[line_i] == '"') {
                     state = PARSE_STATE_IN_QUOTE;
+                } else if (line[line_i] == comment_char) {
+                    got_eol_comment = true;
                 } else {
                     /* Append this character to the argument and remain in
                      * PARSE_STATE_IN_ARG state */
@@ -420,17 +493,61 @@ int str2args(const char *line, char ***argv_ret)
             *argv_ret = argv;
             break;
 
-        /* Unterminated quote or unexpexted state to end on */
         case PARSE_STATE_IN_QUOTE:
+            free_args(argc, argv);
+            argc = -2;
+            break;
+
         default:
-            state = PARSE_STATE_ERROR;
+            free_args(argc, argv);
+            argc = -1;
             break;
     }
 
-    if (state == PARSE_STATE_ERROR) {
-        free_args(argc, argv);
-        return -1;
+    return argc;
+}
+
+int str2lnagain(const char *str, bladerf_lna_gain *gain)
+{
+    *gain = BLADERF_LNA_GAIN_MAX;
+
+    if (!strcasecmp("max", str) ||
+        !strcasecmp("BLADERF_LNA_GAIN_MAX", str)) {
+        *gain = BLADERF_LNA_GAIN_MAX;
+        return 0;
+    } else if (!strcasecmp("mid", str) ||
+               !strcasecmp("BLADERF_LNA_GAIN_MID", str)) {
+        *gain = BLADERF_LNA_GAIN_MID;
+        return 0;
+    } else if (!strcasecmp("bypass", str) ||
+               !strcasecmp("BLADERF_LNA_GAIN_BYPASS", str)) {
+        *gain = BLADERF_LNA_GAIN_BYPASS;
+        return 0;
     } else {
-        return argc;
+        *gain = BLADERF_LNA_GAIN_UNKNOWN;
+        return -1;
+    }
+}
+
+const char *backend_description(bladerf_backend b)
+{
+    switch (b) {
+        case BLADERF_BACKEND_ANY:
+            return "Any";
+
+        case BLADERF_BACKEND_LINUX:
+            return "Linux kernel driver";
+
+        case BLADERF_BACKEND_LIBUSB:
+            return "libusb";
+
+        case BLADERF_BACKEND_CYPRESS:
+            return "Cypress driver";
+
+        case BLADERF_BACKEND_DUMMY:
+            return "Dummy";
+
+        default:
+            return "Unknown";
     }
 }

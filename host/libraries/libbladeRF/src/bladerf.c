@@ -26,27 +26,36 @@
 
 #include "libbladeRF.h"     /* Public API */
 #include "bladerf_priv.h"   /* Implementation-specific items ("private") */
+#include "async.h"
+#include "sync.h"
+#include "tuning.h"
+#include "gain.h"
 #include "lms.h"
+#include "xb.h"
 #include "si5338.h"
 #include "file_ops.h"
 #include "log.h"
-#include "backend.h"
+#include "backend/backend.h"
 #include "device_identifier.h"
 #include "version.h"       /* Generated at build time */
 #include "conversions.h"
+#include "dc_cal_table.h"
+#include "config.h"
+#include "version_compat.h"
+#include "fpga.h"
+#include "flash_fields.h"
+#include "backend/usb/usb.h"
+#include "fx3_fw.h"
 
-/*------------------------------------------------------------------------------
- * Device discovery & initialization/deinitialization
- *----------------------------------------------------------------------------*/
-
-int bladerf_get_device_list(struct bladerf_devinfo **devices)
+static int probe(backend_probe_target target_device,
+                 struct bladerf_devinfo **devices)
 {
     int ret;
     size_t num_devices;
     struct bladerf_devinfo *devices_local;
     int status;
 
-    status = backend_probe(&devices_local, &num_devices);
+    status = backend_probe(target_device, &devices_local, &num_devices);
 
     if (status < 0) {
         ret = status;
@@ -59,6 +68,15 @@ int bladerf_get_device_list(struct bladerf_devinfo **devices)
     return ret;
 }
 
+/*------------------------------------------------------------------------------
+ * Device discovery & initialization/deinitialization
+ *----------------------------------------------------------------------------*/
+
+int bladerf_get_device_list(struct bladerf_devinfo **devices)
+{
+    return probe(BACKEND_PROBE_BLADERF, devices);
+}
+
 void bladerf_free_device_list(struct bladerf_devinfo *devices)
 {
     /* Admittedly, we could just have the user call free() directly,
@@ -67,82 +85,151 @@ void bladerf_free_device_list(struct bladerf_devinfo *devices)
     free(devices);
 }
 
-static void init_stats(struct bladerf_stats *stats)
+int bladerf_open_with_devinfo(struct bladerf **opened_device,
+                              struct bladerf_devinfo *devinfo)
 {
-    stats->rx_overruns = 0;
-    stats->rx_throughput = 0;
-    stats->tx_underruns = 0;
-    stats->tx_throughput = 0;
-}
-
-int bladerf_open_with_devinfo(struct bladerf **device,
-                                struct bladerf_devinfo *devinfo)
-{
-    struct bladerf *opened_device;
+    struct bladerf *dev;
+    struct bladerf_devinfo any_device;
     int status;
 
-    *device = NULL;
-    status = backend_open(device, devinfo);
+    if (devinfo == NULL) {
+        bladerf_init_devinfo(&any_device);
+        devinfo = &any_device;
+    }
 
-    if (!status) {
+    *opened_device = NULL;
 
-        /* Catch bugs from backends returning status = 0, but a NULL device */
-        assert(*device);
-        opened_device = *device;
+    dev = (struct bladerf *)calloc(1, sizeof(struct bladerf));
+    if (dev == NULL) {
+        return BLADERF_ERR_MEM;
+    }
 
-        /* We got a device */
-        bladerf_set_error(&opened_device->error, ETYPE_LIBBLADERF, 0);
-        init_stats(&opened_device->stats);
+    MUTEX_INIT(&dev->ctrl_lock);
+    MUTEX_INIT(&dev->sync_lock[BLADERF_MODULE_RX]);
+    MUTEX_INIT(&dev->sync_lock[BLADERF_MODULE_TX]);
 
-        status = opened_device->fn->get_device_speed(opened_device,
-                                                     &opened_device->usb_speed);
+    dev->fpga_version.describe = calloc(1, BLADERF_VERSION_STR_MAX + 1);
+    if (dev->fpga_version.describe == NULL) {
+        free(dev);
+        return BLADERF_ERR_MEM;
+    }
 
-        if (status < 0 ||
-                (opened_device->usb_speed != BLADERF_DEVICE_SPEED_HIGH &&
-                 opened_device->usb_speed != BLADERF_DEVICE_SPEED_SUPER)) {
-            opened_device->fn->close((*device));
-            *device = NULL;
-        } else {
-            if (opened_device->legacy) {
-                /* Currently two modes of legacy:
-                 *  - ALT_SETTING
-                 *  - CONFIG_IF
-                 *
-                 * If either of these are set, we should tell the user to update
-                 */
-                printf("********************************************************************************\n");
-                printf("* ENTERING LEGACY MODE, PLEASE UPGRADE TO THE LATEST FIRMWARE BY RUNNING:\n");
-                printf("* wget http://nuand.com/fx3/latest.img ; bladeRF-cli -f latest.img\n");
-                printf("********************************************************************************\n");
-            }
+    dev->fw_version.describe = calloc(1, BLADERF_VERSION_STR_MAX + 1);
+    if (dev->fw_version.describe == NULL) {
+        free((void*)dev->fpga_version.describe);
+        free(dev);
+        return BLADERF_ERR_MEM;
+    }
 
-            if (!(opened_device->legacy & LEGACY_ALT_SETTING)) {
+    status = backend_open(dev, devinfo);
+    if (status != 0) {
+        free((void*)dev->fw_version.describe);
+        free((void*)dev->fpga_version.describe);
+        free(dev);
+        return status;
+    }
 
-                status = bladerf_get_and_cache_vctcxo_trim(opened_device);
-                if (status < 0) {
-                    log_warning( "Could not extract VCTCXO trim value\n" ) ;
-                }
+    status = dev->fn->get_device_speed(dev, &dev->usb_speed);
+    if (status < 0) {
+        log_debug("Failed to get device speed: %s\n",
+                  bladerf_strerror(status));
+        goto error;
+    }
 
-                status = bladerf_get_and_cache_fpga_size(opened_device);
-                if (status < 0) {
-                    log_warning( "Could not extract FPGA size\n" ) ;
-                }
+    switch (dev->usb_speed) {
+        case BLADERF_DEVICE_SPEED_SUPER:
+            dev->msg_size = USB_MSG_SIZE_SS;
+            break;
 
-                /* If any of these routines failed, the dev structure should
-                 * still have had it's fields dummied, so they're safe to
-                 * print here (i.e., not uninitialized) */
-                log_debug("%s: fw=v%s serial=%s trim=0x%.4x fpga_size=%d\n",
-                        __FUNCTION__, opened_device->fw_version.describe,
-                        opened_device->ident.serial, opened_device->dac_trim,
-                        opened_device->fpga_size);
-            }
+        case BLADERF_DEVICE_SPEED_HIGH:
+            dev->msg_size = USB_MSG_SIZE_HS;
+            break;
 
-            /* All status in here is not fatal, so whatever */
-            status = 0 ;
-            if (bladerf_is_fpga_configured(opened_device)) {
-                bladerf_init_device(opened_device);
-            }
+        default:
+            status = BLADERF_ERR_UNEXPECTED;
+            log_error("Unsupported device speed: %d\n", dev->usb_speed);
+            goto error;
+    }
+
+    /* Verify that we have a sufficent firmware version before continuing. */
+    status = version_check_fw(dev);
+    if (status != 0) {
+#ifdef LOGGING_ENABLED
+        if (status == BLADERF_ERR_UPDATE_FW) {
+            struct bladerf_version req;
+            const unsigned int dev_maj = dev->fw_version.major;
+            const unsigned int dev_min = dev->fw_version.minor;
+            const unsigned int dev_pat = dev->fw_version.patch;
+            unsigned int req_maj, req_min, req_pat;
+
+            version_required_fw(dev, &req, false);
+            req_maj = req.major;
+            req_min = req.minor;
+            req_pat = req.patch;
+
+            log_warning("Firmware v%u.%u.%u was detected. libbladeRF v%s "
+                        "requires firmware v%u.%u.%u or later. An upgrade via "
+                        "the bootloader is required.\n\n",
+                        dev_maj, dev_min, dev_pat,
+                        LIBBLADERF_VERSION,
+                        req_maj, req_min, req_pat);
         }
+#endif
+
+        goto error;
+    }
+
+    /* VCTCXO trim and FPGA size are non-fatal indicators that we've
+     * trashed the calibration region of flash. If these were made fatal,
+     * we wouldn't be able to open the device to restore them. */
+    status = get_and_cache_vctcxo_trim(dev);
+    if (status < 0) {
+        log_warning("Failed to get VCTCXO trim value: %s\n",
+                    bladerf_strerror(status));
+    }
+
+    status = get_and_cache_fpga_size(dev);
+    if (status < 0) {
+        log_warning("Failed to get FPGA size %s\n",
+                    bladerf_strerror(status));
+    }
+
+    dev->rx_filter = -1;
+    dev->tx_filter = -1;
+
+    dev->module_format[BLADERF_MODULE_RX] = -1;
+    dev->module_format[BLADERF_MODULE_TX] = -1;
+
+    /* Load any available calibration tables so that the LMS DC register
+     * configurations may be loaded in init_device */
+    status = config_load_dc_cals(dev);
+    if (status != 0) {
+        goto error;
+    }
+
+    status = FPGA_IS_CONFIGURED(dev);
+    if (status > 0) {
+        /* If the FPGA version check fails, just warn, but don't error out.
+         *
+         * If an error code caused this function to bail out, it would prevent a
+         * user from being able to unload and reflash a bitstream being
+         * "autoloaded" from SPI flash. */
+        fpga_check_version(dev);
+
+        status = init_device(dev);
+        if (status != 0) {
+            goto error;
+        }
+    } else {
+        /* Try searching for an FPGA in the config search path */
+        status = config_load_fpga(dev);
+    }
+
+error:
+    if (status < 0) {
+        bladerf_close(dev);
+    } else {
+        *opened_device = dev;
     }
 
     return status;
@@ -169,353 +256,542 @@ int bladerf_open(struct bladerf **device, const char *dev_id)
 void bladerf_close(struct bladerf *dev)
 {
     if (dev) {
+
+        MUTEX_LOCK(&dev->ctrl_lock);
+        sync_deinit(dev->sync[BLADERF_MODULE_RX]);
+        sync_deinit(dev->sync[BLADERF_MODULE_TX]);
+
         dev->fn->close(dev);
+
+        free((void *)dev->fpga_version.describe);
+        free((void *)dev->fw_version.describe);
+
+        dc_cal_tbl_free(&dev->cal.dc_rx);
+        dc_cal_tbl_free(&dev->cal.dc_tx);
+
+        MUTEX_UNLOCK(&dev->ctrl_lock);
+        free(dev);
     }
+}
+
+void bladerf_set_usb_reset_on_open(bool enabled)
+{
+#   if ENABLE_USB_DEV_RESET_ON_OPEN
+    bladerf_usb_reset_device_on_open = enabled;
+
+    log_verbose("USB reset on open %s\n", enabled ? "enabled" : "disabled");
+#   else
+    log_verbose("%s has no effect. "
+                "ENABLE_USB_DEV_RESET_ON_OPEN not set at compile-time.\n",
+                __FUNCTION__);
+#   endif
 }
 
 int bladerf_enable_module(struct bladerf *dev,
                             bladerf_module m, bool enable)
 {
+    int status;
+
+    if (m != BLADERF_MODULE_RX && m != BLADERF_MODULE_TX) {
+        return BLADERF_ERR_INVAL;
+    }
+
+    log_debug("Enable Module: %s - %s\n",
+                (m == BLADERF_MODULE_RX) ? "RX" : "TX",
+                enable ? "True" : "False") ;
+
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    if (enable == false) {
+        sync_deinit(dev->sync[m]);
+        dev->sync[m] = NULL;
+        perform_format_deconfig(dev, m);
+    }
+
     lms_enable_rffe(dev, m, enable);
-    return 0;
+    status = dev->fn->enable_module(dev, m, enable);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_loopback(struct bladerf *dev, bladerf_loopback l)
 {
-    lms_loopback_enable( dev, l );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    if (l == BLADERF_LB_FIRMWARE) {
+        /* Firmware loopback was fully implemented in FW v1.7.1
+         * (1.7.0 could enable it, but 1.7.1 also allowed readback,
+         * so we'll enforce 1.7.1 here. */
+        if (version_less_than(&dev->fw_version, 1, 7, 1)) {
+            log_warning("Firmware v1.7.1 or later is required "
+                        "to use firmware loopback.\n\n");
+            status = BLADERF_ERR_UPDATE_FW;
+            goto out;
+        } else {
+            /* Samples won't reach the LMS when the device is in firmware
+             * loopback mode. By placing the LMS into a loopback mode, we ensure
+             * that the PAs will be disabled, and remain enabled across
+             * frequency changes.
+             */
+            status = lms_set_loopback_mode(dev, BLADERF_LB_RF_LNA3);
+            if (status != 0) {
+                goto out;
+            }
+
+            status = dev->fn->set_firmware_loopback(dev, true);
+        }
+
+    } else {
+
+        /* If applicable, ensure FW loopback is disabled */
+        if (version_greater_or_equal(&dev->fw_version, 1, 7, 1)) {
+            bool fw_lb_enabled = false;
+
+            /* Query first, as the implementation of setting the mode
+             * may interrupt running streams. The API don't guarantee that
+             * switching loopback modes on the fly to work, but we can at least
+             * try to avoid unnecessarily interrupting things...*/
+            status = dev->fn->get_firmware_loopback(dev, &fw_lb_enabled);
+            if (status != 0) {
+                goto out;
+            }
+
+            if (fw_lb_enabled) {
+                status = dev->fn->set_firmware_loopback(dev, false);
+                if (status != 0) {
+                    goto out;
+                }
+            }
+        }
+
+        status =  lms_set_loopback_mode(dev, l);
+    }
+
+out:
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
-
-int bladerf_set_rational_sample_rate(struct bladerf *dev, bladerf_module module, struct bladerf_rational_rate *rate, struct bladerf_rational_rate *actual)
+int bladerf_get_loopback(struct bladerf *dev, bladerf_loopback *l)
 {
-    return si5338_set_rational_sample_rate(dev, module, rate, actual);
+    int status = BLADERF_ERR_UNEXPECTED;
+    *l = BLADERF_LB_NONE;
+
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    if (version_greater_or_equal(&dev->fw_version, 1, 7, 1)) {
+        bool fw_lb_enabled;
+        status = dev->fn->get_firmware_loopback(dev, &fw_lb_enabled);
+        if (status == 0 && fw_lb_enabled) {
+            *l = BLADERF_LB_FIRMWARE;
+        }
+    }
+
+    if (*l == BLADERF_LB_NONE) {
+        status = lms_get_loopback_mode(dev, l);
+    }
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
-int bladerf_set_sample_rate(struct bladerf *dev, bladerf_module module, uint32_t rate, uint32_t *actual)
+int bladerf_set_rational_sample_rate(struct bladerf *dev, bladerf_module module,
+                                     struct bladerf_rational_rate *rate,
+                                     struct bladerf_rational_rate *actual)
 {
-    return si5338_set_sample_rate(dev, module, rate, actual);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = si5338_set_rational_sample_rate(dev, module, rate, actual);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
-int bladerf_get_rational_sample_rate(struct bladerf *dev, bladerf_module module, struct bladerf_rational_rate *rate)
+int bladerf_set_sample_rate(struct bladerf *dev, bladerf_module module,
+                            uint32_t rate, uint32_t *actual)
 {
-    return si5338_get_rational_sample_rate(dev, module, rate);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = si5338_set_sample_rate(dev, module, rate, actual);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
-int bladerf_get_sample_rate(struct bladerf *dev, bladerf_module module, unsigned int *rate)
+int bladerf_get_rational_sample_rate(struct bladerf *dev, bladerf_module module,
+                                     struct bladerf_rational_rate *rate)
 {
-    return si5338_get_sample_rate(dev, module, rate);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = si5338_get_rational_sample_rate(dev, module, rate);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_get_sample_rate(struct bladerf *dev, bladerf_module module,
+                            unsigned int *rate)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = si5338_get_sample_rate(dev, module, rate);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_sampling(struct bladerf *dev, bladerf_sampling *sampling)
 {
-    int status = 0, external = 0;
-    uint8_t val = 0;
+    int status = 0;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    status = bladerf_lms_read( dev, 0x09, &val );
-    if (status) {
-        log_warning( "Could not read state of ADC pin connectivity\n" );
-        goto bladerf_get_sampling__done;
-    }
-    external = val&(1<<7) ? 1 : 0;
+    status = lms_get_sampling(dev, sampling);
 
-    status = bladerf_lms_read( dev, 0x64, &val );
-    if (status) {
-        log_warning( "Could not read RXVGA2 state\n" );
-        goto bladerf_get_sampling__done;
-    }
-    external |= val&(1<<1) ? 0 : 2;
-
-    switch(external) {
-        case 0  : *sampling = BLADERF_SAMPLING_INTERNAL; break;
-        case 3  : *sampling = BLADERF_SAMPLING_EXTERNAL; break;
-        default : *sampling = BLADERF_SAMPLING_UNKNOWN; break;
-    }
-
-bladerf_get_sampling__done:
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return status;
 }
 
 int bladerf_set_sampling(struct bladerf *dev, bladerf_sampling sampling)
 {
-    uint8_t val ;
-    int status = 0 ;
-    if (sampling == BLADERF_SAMPLING_INTERNAL) {
-        /* Disconnect the ADC input from the outside world */
-        status = bladerf_lms_read( dev, 0x09, &val );
-        if (status) {
-            log_warning( "Could not read LMS to connect ADC to external pins\n" );
-            goto bladerf_set_sampling__done ;
-        }
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-        val &= ~(1<<7) ;
-        status = bladerf_lms_write( dev, 0x09, val );
-        if (status) {
-            log_warning( "Could not write LMS to connect ADC to external pins\n" );
-            goto bladerf_set_sampling__done;
-        }
+    status = lms_select_sampling(dev, sampling);
 
-        /* Turn on RXVGA2 */
-        status = bladerf_lms_read( dev, 0x64, &val );
-        if (status) {
-            log_warning( "Could not read LMS to disable RXVGA2\n" );
-            goto bladerf_set_sampling__done;
-        }
-
-        val |= (1<<1) ;
-        status = bladerf_lms_write( dev, 0x64, val );
-        if (status) {
-            log_warning( "Could not write LMS to disable RXVGA2\n" );
-            goto bladerf_set_sampling__done;
-        }
-    } else {
-        /* Turn off RXVGA2 */
-        status = bladerf_lms_read( dev, 0x64, &val );
-        if (status) {
-            log_warning( "Could not read the LMS to enable RXVGA2\n" );
-            goto bladerf_set_sampling__done;
-        }
-
-        val &= ~(1<<1) ;
-        status = bladerf_lms_write( dev, 0x64, val );
-        if (status) {
-            log_warning( "Could not write the LMS to enable RXVGA2\n" );
-            goto bladerf_set_sampling__done;
-        }
-
-        /* Connect the external ADC pins to the internal ADC input */
-        status = bladerf_lms_read( dev, 0x09, &val );
-        if (status) {
-            log_warning( "Could not read the LMS to connect ADC to internal pins\n" );
-            goto bladerf_set_sampling__done;
-        }
-
-        val |= (1<<7) ;
-        status = bladerf_lms_write( dev, 0x09, val );
-        if (status) {
-            log_warning( "Could not write the LMS to connect ADC to internal pins\n" );
-        }
-    }
-
-bladerf_set_sampling__done:
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return status;
 }
 
 int bladerf_set_txvga2(struct bladerf *dev, int gain)
 {
-    if( gain > 25 ) {
-        log_info( "%s: %d being clamped to 25dB\n", __FUNCTION__, gain );
-        gain = 25;
-    }
-    if( gain < 0 ) {
-        log_info( "%s: %d being clamped to 0dB\n", __FUNCTION__, gain );
-        gain = 0;
-    }
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_txvga2_set_gain( dev, gain );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_txvga2_set_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_txvga2(struct bladerf *dev, int *gain)
 {
-    uint8_t gain_u8;
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_txvga2_get_gain( dev, &gain_u8 );
-    *gain = gain_u8;
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_txvga2_get_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_txvga1(struct bladerf *dev, int gain)
 {
-    if( gain < -35 ) {
-        log_info( "%s: %d being clamped to -35dB\n", __FUNCTION__, gain );
-        gain = -35;
-    }
-    if( gain > -4 ) {
-        log_info( "%s: %d being clamped to -4dB\n", __FUNCTION__, gain );
-        gain = -4;
-    }
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_txvga1_set_gain( dev, gain );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_txvga1_set_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_txvga1(struct bladerf *dev, int *gain)
 {
-    *gain = 0;
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_txvga1_get_gain( dev, (int8_t *)gain );
-    *gain |= 0xffffff00 ;
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_txvga1_get_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
+
 
 int bladerf_set_lna_gain(struct bladerf *dev, bladerf_lna_gain gain)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_lna_set_gain( dev, gain );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_lna_set_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_lna_gain(struct bladerf *dev, bladerf_lna_gain *gain)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_lna_get_gain( dev, gain );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_lna_get_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_rxvga1(struct bladerf *dev, int gain)
 {
-    int r;
-    /* TODO: Make return values for lms call and return it for failure */
-    for (r=2; (r * r) < ((gain - 5) << 9); r++);
-    lms_rxvga1_set_gain( dev, r );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_rxvga1_set_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_rxvga1(struct bladerf *dev, int *gain)
 {
-    uint8_t gain_u8;
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_rxvga1_get_gain( dev, &gain_u8 );
-    *gain = 5 + (((int)gain_u8 * (int)gain_u8) >> 9);
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_rxvga1_get_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_rxvga2(struct bladerf *dev, int gain)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    /* Raw value to write which is 3dB per unit */
-    lms_rxvga2_set_gain( dev, (uint8_t)gain/3 );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_rxvga2_set_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_rxvga2(struct bladerf *dev, int *gain)
 {
-    uint8_t gain_u8;
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_rxvga2_get_gain( dev, &gain_u8 );
-    /* Value returned from LMS lib is just the raw value, which is 3dB/unit */
-    *gain = gain_u8 * 3;
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_rxvga2_get_gain(dev, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+
+int bladerf_set_gain(struct bladerf *dev, bladerf_module mod, int gain) {
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = gain_set(dev, mod, gain);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_bandwidth(struct bladerf *dev, bladerf_module module,
-                            unsigned int bandwidth,
-                            unsigned int *actual)
+                          unsigned int bandwidth,
+                          unsigned int *actual)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_bw_t bw = lms_uint2bw(bandwidth);
-    lms_lpf_enable( dev, module, bw );
-    *actual = lms_bw2uint(bw);
-    return 0;
+    int status;
+    lms_bw bw;
+
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    if (bandwidth < BLADERF_BANDWIDTH_MIN) {
+        bandwidth = BLADERF_BANDWIDTH_MIN;
+        log_info("Clamping bandwidth to %dHz\n", bandwidth);
+    } else if (bandwidth > BLADERF_BANDWIDTH_MAX) {
+        bandwidth = BLADERF_BANDWIDTH_MAX;
+        log_info("Clamping bandwidth to %dHz\n", bandwidth);
+    }
+
+    bw = lms_uint2bw(bandwidth);
+
+    status = lms_lpf_enable(dev, module, true);
+    if (status != 0) {
+        goto out;
+    }
+
+    status = lms_set_bandwidth(dev, module, bw);
+    if (actual != NULL) {
+        if (status == 0) {
+            *actual = lms_bw2uint(bw);
+        } else {
+            *actual = 0;
+        }
+    }
+
+out:
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_bandwidth(struct bladerf *dev, bladerf_module module,
-                            unsigned int *bandwidth )
+                            unsigned int *bandwidth)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_bw_t bw = lms_get_bandwidth( dev, module );
-    *bandwidth = lms_bw2uint(bw);
-    return 0;
+    int status;
+    lms_bw bw;
+
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_get_bandwidth( dev, module, &bw);
+
+    if (status == 0) {
+        *bandwidth = lms_bw2uint(bw);
+    } else {
+        *bandwidth = 0;
+    }
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_lpf_mode(struct bladerf *dev, bladerf_module module,
                          bladerf_lpf_mode mode)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_lpf_set_mode( dev, module, mode );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_lpf_set_mode(dev, module, mode);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_lpf_mode(struct bladerf *dev, bladerf_module module,
                          bladerf_lpf_mode *mode)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_lpf_get_mode( dev, module, mode );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_lpf_get_mode(dev, module, mode);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_select_band(struct bladerf *dev, bladerf_module module,
                         unsigned int frequency)
 {
-    uint32_t gpio ;
-    uint32_t band = 0;
-    lms_lna_t lna ;
-    lms_pa_t pa ;
-    if( frequency >= 1500000000 ) {
-        band = 1; // High Band selection
-        lna = LNA_2;
-        pa = PA_2;
-    } else {
-        band = 2; // Low Band selection
-        lna = LNA_1;
-        pa = PA_1;
-    }
-    if (module == BLADERF_MODULE_TX) {
-        lms_pa_enable(dev, pa);
-    } else {
-        lms_lna_select(dev, lna);
-    }
-    bladerf_config_gpio_read(dev, &gpio);
-    gpio &= ~(module == BLADERF_MODULE_TX ? (3<<3) : (3<<5));
-    gpio |= (module == BLADERF_MODULE_TX ? (band<<3) : (band<<5));
-    bladerf_config_gpio_write(dev, gpio);
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = tuning_select_band(dev, module, frequency);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_set_frequency(struct bladerf *dev,
-                            bladerf_module module, unsigned int frequency)
+                          bladerf_module module, unsigned int frequency)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    lms_set_frequency( dev, module, frequency );
-    bladerf_select_band( dev, module, frequency );
-    return 0;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = tuning_set_freq(dev, module, frequency);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_get_frequency(struct bladerf *dev,
                             bladerf_module module, unsigned int *frequency)
 {
-    /* TODO: Make return values for lms call and return it for failure */
-    struct lms_freq f;
-    int rv = 0;
-    lms_get_frequency( dev, module, &f );
-    if( f.x == 0 ) {
-        *frequency = 0 ;
-        rv = BLADERF_ERR_INVAL;
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = tuning_get_freq(dev, module, frequency);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_set_stream_timeout(struct bladerf *dev, bladerf_module module,
+                               unsigned int timeout) {
+
+    if (dev) {
+        MUTEX_LOCK(&dev->ctrl_lock);
+        dev->transfer_timeout[module] = timeout;
+        MUTEX_UNLOCK(&dev->ctrl_lock);
+        return 0;
+
     } else {
-        *frequency = lms_frequency_to_hz(&f);
-    }
-    return rv;
-}
-
-void bladerf_set_transfer_timeout(struct bladerf *dev, bladerf_module module, int timeout) {
-    dev->fn->set_transfer_timeout(dev, module, timeout);
-}
-
-int get_transfer_timeout(struct bladerf *dev, bladerf_module module) {
-    return dev->fn->get_transfer_timeout(dev, module);
-}
-
-int bladerf_tx(struct bladerf *dev, bladerf_format format, void *samples,
-               int num_samples, struct bladerf_metadata *metadata)
-{
-    if (num_samples < 1024 || num_samples % 1024 != 0) {
-        log_warning("num_samples must be multiples of 1024\n");
         return BLADERF_ERR_INVAL;
     }
-
-    return dev->fn->tx(dev, format, samples, num_samples, metadata);
 }
 
-int bladerf_rx(struct bladerf *dev, bladerf_format format, void *samples,
-                   int num_samples, struct bladerf_metadata *metadata)
-{
-    if (num_samples < 1024 || num_samples % 1024 != 0) {
-        log_warning("num_samples must be multiples of 1024\n");
+int bladerf_get_stream_timeout(struct bladerf *dev, bladerf_module module,
+                               unsigned int *timeout) {
+    if (dev) {
+        MUTEX_LOCK(&dev->ctrl_lock);
+        *timeout = dev->transfer_timeout[module];
+        MUTEX_UNLOCK(&dev->ctrl_lock);
+        return 0;
+    } else {
         return BLADERF_ERR_INVAL;
     }
+}
 
-    return dev->fn->rx(dev, format, samples, num_samples, metadata);
+int bladerf_sync_config(struct bladerf *dev,
+                        bladerf_module module,
+                        bladerf_format format,
+                        unsigned int num_buffers,
+                        unsigned int buffer_size,
+                        unsigned int num_transfers,
+                        unsigned int stream_timeout)
+{
+    int status;
+
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = perform_format_config(dev, module, format);
+    if (status == 0) {
+        MUTEX_LOCK(&dev->sync_lock[module]);
+
+        dev->transfer_timeout[module] = stream_timeout;
+
+        status = sync_init(dev, module, format, num_buffers, buffer_size,
+                num_transfers, stream_timeout);
+
+        if (status != 0) {
+            perform_format_deconfig(dev, module);
+        }
+
+        MUTEX_UNLOCK(&dev->sync_lock[module]);
+    }
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_sync_tx(struct bladerf *dev,
+                    void *samples, unsigned int num_samples,
+                    struct bladerf_metadata *metadata,
+                    unsigned int timeout_ms)
+{
+    int status;
+
+    MUTEX_LOCK(&dev->sync_lock[BLADERF_MODULE_TX]);
+    status = sync_tx(dev, samples, num_samples, metadata, timeout_ms);
+    MUTEX_UNLOCK(&dev->sync_lock[BLADERF_MODULE_TX]);
+
+    return status;
+}
+
+int bladerf_sync_rx(struct bladerf *dev,
+                    void *samples, unsigned int num_samples,
+                    struct bladerf_metadata *metadata,
+                    unsigned int timeout_ms)
+{
+    int status;
+
+    MUTEX_LOCK(&dev->sync_lock[BLADERF_MODULE_RX]);
+    status = sync_rx(dev, samples, num_samples, metadata, timeout_ms);
+    MUTEX_UNLOCK(&dev->sync_lock[BLADERF_MODULE_RX]);
+
+    return status;
 }
 
 int bladerf_init_stream(struct bladerf_stream **stream,
@@ -526,139 +802,58 @@ int bladerf_init_stream(struct bladerf_stream **stream,
                         bladerf_format format,
                         size_t samples_per_buffer,
                         size_t num_transfers,
-                        void *user_data)
+                        void *data)
 {
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    struct bladerf_stream *lstream;
-    size_t buffer_size_bytes;
-    size_t i;
-    int status = 0;
+    status = async_init_stream(stream, dev, callback, buffers, num_buffers,
+                               format, samples_per_buffer, num_transfers, data);
 
-    if (num_transfers > num_buffers) {
-        log_warning("num_transfers must be <= num_buffers\n");
-        return BLADERF_ERR_INVAL;
-    }
-
-    if (samples_per_buffer < 1024 || samples_per_buffer% 1024 != 0) {
-        log_warning("samples_per_buffer must be multiples of 1024\n");
-        return BLADERF_ERR_INVAL;
-    }
-
-    /* Create a stream and populate it with the appropriate information */
-    lstream = malloc(sizeof(struct bladerf_stream));
-
-    if (!lstream) {
-        return BLADERF_ERR_MEM;
-    }
-
-    lstream->dev = dev;
-    lstream->error_code = 0;
-    lstream->state = STREAM_IDLE;
-    lstream->samples_per_buffer = samples_per_buffer;
-    lstream->num_buffers = num_buffers;
-    lstream->num_transfers = num_transfers;
-    lstream->format = format;
-    lstream->cb = callback;
-    lstream->user_data = user_data;
-    lstream->buffers = NULL;
-
-    switch(format) {
-        case BLADERF_FORMAT_SC16_Q12:
-            buffer_size_bytes = c16_samples_to_bytes(samples_per_buffer);
-            break;
-
-        default:
-            status = BLADERF_ERR_INVAL;
-            break;
-    }
-
-    if (!status) {
-        lstream->buffers = calloc(num_buffers, sizeof(lstream->buffers[0]));
-        if (lstream->buffers) {
-            for (i = 0; i < num_buffers && !status; i++) {
-                lstream->buffers[i] = calloc(1, buffer_size_bytes);
-                if (!lstream->buffers[i]) {
-                    status = BLADERF_ERR_MEM;
-                }
-            }
-        } else {
-            status = BLADERF_ERR_MEM;
-        }
-    }
-
-    /* Clean up everything we've allocated if we hit any errors */
-    if (status) {
-
-        if (lstream->buffers) {
-            for (i = 0; i < num_buffers; i++) {
-                free(lstream->buffers[i]);
-            }
-
-            free(lstream->buffers);
-        }
-
-        free(lstream);
-    } else {
-        /* Perform any backend-specific stream initialization */
-        status = dev->fn->init_stream(lstream);
-
-        if (status < 0) {
-            bladerf_deinit_stream(lstream);
-            *stream = NULL;
-        } else {
-            /* Update the caller's pointers */
-            *stream = lstream;
-            *buffers = lstream->buffers;
-        }
-    }
-
-
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return status;
-}
-
-void bladerf_deinit_stream(struct bladerf_stream *stream)
-{
-    size_t i;
-
-    if (!stream) {
-        return;
-    }
-
-    while(stream->state != STREAM_DONE && stream->state != STREAM_IDLE) {
-        log_info( "Stream not done...\n" );
-        usleep(1000000);
-    }
-
-    /* Free up the backend data */
-    stream->dev->fn->deinit_stream(stream);
-
-    /* Free up the buffers */
-    for (i = 0; i < stream->num_buffers; i++) {
-        free(stream->buffers[i]);
-    }
-
-    /* Free up the pointer to the buffers */
-    free(stream->buffers);
-
-    /* Free up the stream itself */
-    free(stream);
-
-    /* Done */
-    return ;
 }
 
 int bladerf_stream(struct bladerf_stream *stream, bladerf_module module)
 {
-    int status;
-    struct bladerf *dev = stream->dev;
+    int stream_status, fmt_status;
 
-    stream->module = module;
-    stream->state = STREAM_RUNNING;
-    status = dev->fn->stream(stream, module);
+    MUTEX_LOCK(&stream->dev->ctrl_lock);
+    fmt_status = perform_format_config(stream->dev, module, stream->format);
+    MUTEX_UNLOCK(&stream->dev->ctrl_lock);
 
-    /* Backend return value takes precedence over stream error status */
-    return status == 0 ? stream->error_code : status;
+    if (fmt_status != 0) {
+        return fmt_status;
+    }
+
+    /* Reminder: as we're not holding the control lock, no control calls should
+     * be made in asyn_run_stream down through the backend code */
+    stream_status = async_run_stream(stream, module);
+
+    MUTEX_LOCK(&stream->dev->ctrl_lock);
+    fmt_status = perform_format_deconfig(stream->dev, module);
+    MUTEX_UNLOCK(&stream->dev->ctrl_lock);
+
+    return stream_status == 0 ? fmt_status : stream_status;
 }
+
+int bladerf_submit_stream_buffer(struct bladerf_stream *stream,
+                                 void *buffer,
+                                 unsigned int timeout_ms)
+{
+    return async_submit_stream_buffer(stream, buffer, timeout_ms);
+}
+
+void bladerf_deinit_stream(struct bladerf_stream *stream)
+{
+    if (stream && stream->dev) {
+        struct bladerf *dev = stream->dev;
+        MUTEX_LOCK(&dev->ctrl_lock);
+        async_deinit_stream(stream);
+        MUTEX_UNLOCK(&dev->ctrl_lock);
+    }
+}
+
 
 /*------------------------------------------------------------------------------
  * Device Info
@@ -666,239 +861,210 @@ int bladerf_stream(struct bladerf_stream *stream, bladerf_module module)
 
 int bladerf_get_serial(struct bladerf *dev, char *serial)
 {
+    MUTEX_LOCK(&dev->ctrl_lock);
     strcpy(serial, dev->ident.serial);
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return 0;
 }
 
 int bladerf_get_vctcxo_trim(struct bladerf *dev, uint16_t *trim)
 {
+    MUTEX_LOCK(&dev->ctrl_lock);
     *trim = dev->dac_trim;
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return 0;
 }
 
 int bladerf_get_fpga_size(struct bladerf *dev, bladerf_fpga_size *size)
 {
+    MUTEX_LOCK(&dev->ctrl_lock);
     *size = dev->fpga_size;
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return 0;
 }
 
 int bladerf_fw_version(struct bladerf *dev, struct bladerf_version *version)
 {
+    MUTEX_LOCK(&dev->ctrl_lock);
     memcpy(version, &dev->fw_version, sizeof(*version));
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return 0;
 }
 
 int bladerf_is_fpga_configured(struct bladerf *dev)
 {
-    return dev->fn->is_fpga_configured(dev);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = FPGA_IS_CONFIGURED(dev);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_fpga_version(struct bladerf *dev, struct bladerf_version *version)
 {
+    MUTEX_LOCK(&dev->ctrl_lock);
     memcpy(version, &dev->fpga_version, sizeof(*version));
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return 0;
-}
-
-int bladerf_stats(struct bladerf *dev, struct bladerf_stats *stats)
-{
-    return dev->fn->stats(dev, stats);
 }
 
 bladerf_dev_speed bladerf_device_speed(struct bladerf *dev)
 {
-    return dev->usb_speed;
+    bladerf_dev_speed speed;
+    MUTEX_LOCK(&dev->ctrl_lock);
+    speed = dev->usb_speed;
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return speed;
 }
 
 /*------------------------------------------------------------------------------
  * Device Programming
  *----------------------------------------------------------------------------*/
-int bladerf_flash_firmware(struct bladerf *dev, const char *firmware_file)
+
+int bladerf_erase_flash(struct bladerf *dev,
+                        uint32_t erase_block, uint32_t count)
 {
     int status;
-    uint8_t *buf, *buf_padded;
-    size_t buf_size, buf_size_padded;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    status = read_file(firmware_file, &buf, &buf_size);
-    if (!status) {
-        /* Sanity check firmware
-         *
-         * Quick and dirty check for any absurd sizes. This is arbitrarily
-         * chosen based upon the current FX3 image size.
-         *
-         * TODO This should be replaced with something that also looks for:
-         *  - Known header/footer on images?
-         *  - Checksum/hash?
-         */
-        if (!getenv("BLADERF_SKIP_FW_SIZE_CHECK") &&
-                (buf_size < (50 * 1024) || (buf_size > (1 * 1024 * 1024)))) {
-            log_error("Error: Detected potentially invalid firmware file.\n");
-            log_error("Define BLADERF_SKIP_FW_SIZE_CHECK in your evironment "
-                       "to skip this check.\n");
-            status = BLADERF_ERR_INVAL;
-        } else {
-            /* Pad firmare data out to a flash sector size */
-            const size_t sector_size = BLADERF_FLASH_SECTOR_SIZE;
-            size_t buf_size_padding = sector_size - (buf_size % sector_size);
+    status = flash_erase(dev, erase_block, count);
 
-            buf_size_padded = buf_size + buf_size_padding;
-            buf_padded = realloc(buf, buf_size_padded);
-            if (!buf_padded) {
-                status = BLADERF_ERR_MEM;
-            } else {
-                buf = buf_padded;
-                memset(buf + buf_size, 0xFF, buf_size_padded - buf_size);
-            }
-
-            if (!status) {
-                status = dev->fn->flash_firmware(dev, buf, buf_size_padded);
-            }
-            if (!status) {
-                if (dev->legacy & LEGACY_ALT_SETTING) {
-                    printf("DEVICE OPERATING IN LEGACY MODE, MANUAL RESET IS NECESSARY AFTER SUCCESSFUL UPGRADE\n");
-                }
-            }
-        }
-
-        free(buf);
-    }
-
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return status;
 }
 
-int bladerf_erase_flash(struct bladerf *dev, uint32_t addr, uint32_t len)
+int bladerf_read_flash(struct bladerf *dev, uint8_t *buf,
+                       uint32_t page, uint32_t count)
 {
-    if (!dev->fn->erase_flash) {
-        return BLADERF_ERR_UNSUPPORTED;
-    }
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    return dev->fn->erase_flash(dev, addr, len);
+    status = flash_read(dev, buf, page, count);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
-int bladerf_read_flash(struct bladerf *dev, uint32_t addr,
-                       uint8_t *buf, uint32_t len)
+int bladerf_write_flash(struct bladerf *dev, const uint8_t *buf,
+                        uint32_t page, uint32_t count)
 {
-    if (!dev->fn->read_flash) {
-        return BLADERF_ERR_UNSUPPORTED;
-    }
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    return dev->fn->read_flash(dev, addr, buf, len);
-}
+    status = flash_write(dev, buf, page, count);
 
-int bladerf_write_flash(struct bladerf *dev, uint32_t addr,
-                       uint8_t *buf, uint32_t len)
-{
-    if (!dev->fn->write_flash) {
-        return BLADERF_ERR_UNSUPPORTED;
-    }
-
-    return dev->fn->write_flash(dev, addr, buf, len);
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_device_reset(struct bladerf *dev)
 {
-    return dev->fn->device_reset(dev);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->device_reset(dev);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_jump_to_bootloader(struct bladerf *dev)
 {
+    int status;
+
     if (!dev->fn->jump_to_bootloader) {
         return BLADERF_ERR_UNSUPPORTED;
     }
 
-    return dev->fn->jump_to_bootloader(dev);
+    MUTEX_LOCK(&dev->ctrl_lock);
+    status = dev->fn->jump_to_bootloader(dev);
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
-int bladerf_flash_fpga(struct bladerf *dev, const char *fpga_file)
+static inline bool valid_fw_size(size_t len)
+{
+    /* Simple FW applications generally are significantly larger than this */
+    if (len < (50 * 1024)) {
+        return false;
+    } else if (len > BLADERF_FLASH_BYTE_LEN_FIRMWARE) {
+        return false;
+    } else {
+        return true;
+    }
+}
+
+int bladerf_flash_firmware(struct bladerf *dev, const char *firmware_file)
 {
     int status;
-    char fpga_len[10];
-    uint8_t *buf, *buf_padded, *ver;
-    size_t buf_size, buf_size_padded;
-    int hp_idx = 0;
+    uint8_t *buf = NULL;
+    size_t buf_size;
+    const char env_override[] = "BLADERF_SKIP_FW_SIZE_CHECK";
 
-    if (strcmp("X", fpga_file) == 0) {
-        printf("Disabling FPGA flash auto-load\n");
-        return (dev->fn->erase_flash(dev, flash_from_sectors(4), BLADERF_FLASH_SECTOR_SIZE) != BLADERF_FLASH_SECTOR_SIZE);
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = file_read_buffer(firmware_file, &buf, &buf_size);
+    if (status != 0) {
+        goto out;
     }
 
-    status = read_file(fpga_file, &buf, &buf_size);
-    if (status == 0) {
-        if ((getenv("BLADERF_SKIP_FPGA_SIZE_CHECK") == 0)  &&
-                (buf_size < (1 * 1024 * 1024) || (buf_size > (5 * 1024 * 1024)))) {
-            log_error("Error: Detected potentially invalid firmware file.\n");
-            log_error("Define BLADERF_SKIP_FPGA_SIZE_CHECK in your evironment "
-                       "to skip this check.\n");
-            status = BLADERF_ERR_INVAL;
-        } else {
-            const size_t page_size = BLADERF_FLASH_SECTOR_SIZE;
-            size_t buf_size_padding = page_size - (buf_size % page_size);
-
-            /* Pad firmare data out to a flash page size */
-            buf_size_padded = buf_size + buf_size_padding + page_size;
-            buf_padded = (uint8_t*)realloc(buf, buf_size_padded);
-            if (buf_padded == NULL) {
-                status = BLADERF_ERR_MEM;
-            } else {
-                buf = buf_padded;
-                memset(buf + buf_size, 0xFF, buf_size_padded - buf_size - BLADERF_FLASH_SECTOR_SIZE);
-                memmove(&buf[BLADERF_FLASH_PAGE_SIZE], buf, buf_size_padded - BLADERF_FLASH_SECTOR_SIZE);
-                snprintf(fpga_len, 9, "%d", (int)buf_size);
-                memset(buf, 0xff, BLADERF_FLASH_PAGE_SIZE);
-                encode_field((char *)buf, BLADERF_FLASH_PAGE_SIZE, &hp_idx, "LEN", fpga_len);
-
-                if (status == 0) {
-                    status = dev->fn->erase_flash(dev, flash_from_sectors(4), (uint32_t)buf_size_padded);
-                }
-
-                if (status >= 0) {
-                    status = dev->fn->write_flash(dev, flash_from_pages(1024), buf, (uint32_t)buf_size_padded);
-                }
-
-                ver = (uint8_t *)malloc(buf_size_padded);
-                if (!ver)
-                    status = BLADERF_ERR_MEM;
-
-                if (status >= 0) {
-                    status = dev->fn->read_flash(dev, flash_from_pages(1024), ver, (uint32_t)buf_size_padded);
-                }
-
-                if ((size_t)status == buf_size_padded) {
-                    status = memcmp(buf, ver, buf_size_padded);
-                }
-
-                free(ver);
-            }
-        }
-        free(buf);
+    /* Sanity check firmware length.
+     *
+     * TODO in the future, better sanity checks can be performed when
+     *      using the bladerf image format currently used to backup/restore
+     *      calibration data
+     */
+    if (!getenv(env_override) && !valid_fw_size(buf_size)) {
+        log_info("Detected potentially invalid firmware file.\n");
+        log_info("Define BLADERF_SKIP_FW_SIZE_CHECK in your evironment "
+                "to skip this check.\n");
+        status = BLADERF_ERR_INVAL;
+    } else {
+        status = flash_write_fx3_fw(dev, &buf, buf_size);
     }
 
+out:
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    free(buf);
     return status;
 }
 
 int bladerf_load_fpga(struct bladerf *dev, const char *fpga_file)
 {
-    uint8_t *buf;
-    size_t  buf_size;
     int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    /* TODO sanity check FPGA:
-     *  - Check for x40 vs x115 and verify FPGA image size
-     *  - Known header/footer on images?
-     *  - Checksum/hash?
-     */
+    status = fpga_load_from_file(dev, fpga_file);
 
-    status = read_file(fpga_file, &buf, &buf_size);
-    if (!status) {
-        status = dev->fn->load_fpga(dev, buf, buf_size);
-        free(buf);
-    }
-
-    if (!status) {
-        status = bladerf_init_device(dev);
-    }
-
+    MUTEX_UNLOCK(&dev->ctrl_lock);
     return status;
 }
+
+
+int bladerf_flash_fpga(struct bladerf *dev, const char *fpga_file)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = fpga_write_to_flash(dev, fpga_file);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_erase_stored_fpga(struct bladerf *dev)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = flash_erase_fpga(dev);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
 
 /*------------------------------------------------------------------------------
  * Misc.
@@ -925,6 +1091,16 @@ const char * bladerf_strerror(int error)
             return "Operation not supported";
         case BLADERF_ERR_MISALIGNED:
             return "Misaligned flash access";
+        case BLADERF_ERR_CHECKSUM:
+            return "Invalid checksum";
+        case BLADERF_ERR_NO_FILE:
+            return "File not found";
+        case BLADERF_ERR_UPDATE_FPGA:
+            return "An FPGA update is required";
+        case BLADERF_ERR_UPDATE_FW:
+            return "A firmware update is required";
+        case BLADERF_ERR_TIME_PAST:
+            return "Requested timestamp is in the past";
         case 0:
             return "Success";
         default:
@@ -943,6 +1119,9 @@ void bladerf_version(struct bladerf_version *version)
 void bladerf_log_set_verbosity(bladerf_log_level level)
 {
     log_set_verbosity(level);
+#if defined(LOG_SYSLOG_ENABLED)
+    log_debug("Log verbosity has been set to: %d", level);
+#endif
 }
 
 /*------------------------------------------------------------------------------
@@ -964,7 +1143,9 @@ void bladerf_init_devinfo(struct bladerf_devinfo *info)
 int bladerf_get_devinfo(struct bladerf *dev, struct bladerf_devinfo *info)
 {
     if (dev) {
+        MUTEX_LOCK(&dev->ctrl_lock);
         memcpy(info, &dev->ident, sizeof(struct bladerf_devinfo));
+        MUTEX_UNLOCK(&dev->ctrl_lock);
         return 0;
     } else {
         return BLADERF_ERR_INVAL;
@@ -996,7 +1177,7 @@ bool bladerf_devstr_matches(const char *dev_str,
     status = str2devinfo(dev_str, &from_str);
     if (status < 0) {
         ret = false;
-        log_error("Failed to parse device string: %s\n",
+        log_debug("Failed to parse device string: %s\n",
                   bladerf_strerror(status));
     } else {
         ret = bladerf_devinfo_matches(&from_str, info);
@@ -1005,32 +1186,85 @@ bool bladerf_devstr_matches(const char *dev_str,
     return ret;
 }
 
+const char * bladerf_backend_str(bladerf_backend backend)
+{
+    return backend2str(backend);
+}
+
 /*------------------------------------------------------------------------------
  * Si5338 register read / write functions
  *----------------------------------------------------------------------------*/
 
 int bladerf_si5338_read(struct bladerf *dev, uint8_t address, uint8_t *val)
 {
-    return dev->fn->si5338_read(dev,address,val);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->si5338_read(dev,address,val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_si5338_write(struct bladerf *dev, uint8_t address, uint8_t val)
 {
-    return dev->fn->si5338_write(dev,address,val);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->si5338_write(dev,address,val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 /*------------------------------------------------------------------------------
- * LMS register read / write functions
+ * LMS register access and low-level functions
  *----------------------------------------------------------------------------*/
 
 int bladerf_lms_read(struct bladerf *dev, uint8_t address, uint8_t *val)
 {
-    return dev->fn->lms_read(dev,address,val);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->lms_read(dev,address,val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_lms_write(struct bladerf *dev, uint8_t address, uint8_t val)
 {
-    return dev->fn->lms_write(dev,address,val);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->lms_write(dev,address,val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_lms_set_dc_cals(struct bladerf *dev,
+                            const struct bladerf_lms_dc_cals *dc_cals)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_set_dc_cals(dev, dc_cals);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_lms_get_dc_cals(struct bladerf *dev,
+                            struct bladerf_lms_dc_cals *dc_cals)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_get_dc_cals(dev, dc_cals);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 /*------------------------------------------------------------------------------
@@ -1039,23 +1273,196 @@ int bladerf_lms_write(struct bladerf *dev, uint8_t address, uint8_t val)
 
 int bladerf_config_gpio_read(struct bladerf *dev, uint32_t *val)
 {
-    return dev->fn->config_gpio_read(dev,val);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = CONFIG_GPIO_READ(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 int bladerf_config_gpio_write(struct bladerf *dev, uint32_t val)
 {
-    /* If we're connected at HS, we need to use smaller DMA transfers */
-    if (dev->usb_speed == BLADERF_DEVICE_SPEED_HIGH   ) {
-        val |= BLADERF_GPIO_FEATURE_SMALL_DMA_XFER;
-    } else if (dev->usb_speed == BLADERF_DEVICE_SPEED_SUPER) {
-        val &= ~BLADERF_GPIO_FEATURE_SMALL_DMA_XFER;
-    } else {
-        log_error("Encountered unknown USB speed in %s\n", __FUNCTION__);
-        return BLADERF_ERR_UNEXPECTED;
-    }
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
 
-    return dev->fn->config_gpio_write(dev,val);
+    status = CONFIG_GPIO_WRITE(dev, val);
 
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+
+}
+
+/*------------------------------------------------------------------------------
+ * Expansion board configuration
+ *----------------------------------------------------------------------------*/
+int bladerf_expansion_attach(struct bladerf *dev, bladerf_xb xb)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = xb_attach(dev, xb);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_expansion_get_attached(struct bladerf *dev, bladerf_xb *xb)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = xb_get_attached(dev, xb);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_xb200_set_filterbank(struct bladerf *dev,
+                                 bladerf_module mod,
+                                 bladerf_xb200_filter filter)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = xb200_set_filterbank(dev, mod, filter);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_xb200_get_filterbank(struct bladerf *dev,
+                                 bladerf_module module,
+                                 bladerf_xb200_filter *filter)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = xb200_get_filterbank(dev, module, filter);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_xb200_set_path(struct bladerf *dev,
+                           bladerf_module module,
+                           bladerf_xb200_path path)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = xb200_set_path(dev, module, path);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_xb200_get_path(struct bladerf *dev,
+                                     bladerf_module module,
+                                     bladerf_xb200_path *path)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = xb200_get_path(dev, module, path);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+
+/*------------------------------------------------------------------------------
+ * Expansion board GPIO register read / write functions
+ *----------------------------------------------------------------------------*/
+
+int bladerf_expansion_gpio_read(struct bladerf *dev, uint32_t *val)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = XB_GPIO_READ(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_expansion_gpio_write(struct bladerf *dev, uint32_t val)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = XB_GPIO_WRITE(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+/*------------------------------------------------------------------------------
+ * Expansion board GPIO direction register read / write functions
+ *----------------------------------------------------------------------------*/
+
+int bladerf_expansion_gpio_dir_read(struct bladerf *dev, uint32_t *val)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = XB_GPIO_DIR_READ(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_expansion_gpio_dir_write(struct bladerf *dev, uint32_t val)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = XB_GPIO_DIR_WRITE(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+/*------------------------------------------------------------------------------
+ * IQ Calibration routines
+ *----------------------------------------------------------------------------*/
+int bladerf_set_correction(struct bladerf *dev, bladerf_module module,
+                           bladerf_correction corr, int16_t value)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->set_correction(dev, module, corr, value);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+int bladerf_get_correction(struct bladerf *dev, bladerf_module module,
+                           bladerf_correction corr, int16_t *value)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->get_correction(dev, module, corr, value);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+/*------------------------------------------------------------------------------
+ * Get current timestamp counter
+ *----------------------------------------------------------------------------*/
+int bladerf_get_timestamp(struct bladerf *dev, bladerf_module module, uint64_t *value)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = dev->fn->get_timestamp(dev,module,value);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 /*------------------------------------------------------------------------------
@@ -1064,13 +1471,86 @@ int bladerf_config_gpio_write(struct bladerf *dev, uint32_t val)
 
 int bladerf_dac_write(struct bladerf *dev, uint16_t val)
 {
-    return dev->fn->dac_write(dev,val);
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = DAC_WRITE(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+
+/*------------------------------------------------------------------------------
+ * XB SPI register write
+ *----------------------------------------------------------------------------*/
+
+int bladerf_xb_spi_write(struct bladerf *dev, uint32_t val)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = XB_SPI_WRITE(dev, val);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
 }
 
 /*------------------------------------------------------------------------------
  * DC Calibration routines
  *----------------------------------------------------------------------------*/
- int bladerf_calibrate_dc(struct bladerf *dev, bladerf_cal_module module)
- {
-    return lms_calibrate_dc(dev, module);
- }
+int bladerf_calibrate_dc(struct bladerf *dev, bladerf_cal_module module)
+{
+    int status;
+    MUTEX_LOCK(&dev->ctrl_lock);
+
+    status = lms_calibrate_dc(dev, module);
+
+    MUTEX_UNLOCK(&dev->ctrl_lock);
+    return status;
+}
+
+/*------------------------------------------------------------------------------
+ * Bootloader recovery
+ *----------------------------------------------------------------------------*/
+
+int bladerf_get_bootloader_list(struct bladerf_devinfo **devices)
+{
+    return probe(BACKEND_PROBE_FX3_BOOTLOADER, devices);
+}
+
+int bladerf_load_fw_from_bootloader(const char *device_identifier,
+                                    bladerf_backend backend,
+                                    uint8_t bus, uint8_t addr,
+                                    const char *file)
+{
+    int status;
+    struct fx3_firmware *fw = NULL;
+    struct bladerf_devinfo devinfo;
+
+    if (device_identifier == NULL) {
+        bladerf_init_devinfo(&devinfo);
+        devinfo.backend = backend;
+        devinfo.usb_bus = bus;
+        devinfo.usb_addr = addr;
+    } else {
+        status = str2devinfo(device_identifier, &devinfo);
+        if (status != 0) {
+            return status;
+        }
+    }
+
+    status = fx3_fw_read(file, &fw);
+    if (status != 0) {
+        return status;
+    }
+
+    assert(fw != NULL);
+
+    status = backend_load_fw_from_bootloader(devinfo.backend, devinfo.usb_bus,
+                                             devinfo.usb_addr, fw);
+
+
+    fx3_fw_deinit(fw);
+    return status;
+}
